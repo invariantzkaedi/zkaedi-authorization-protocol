@@ -49,25 +49,135 @@ A zero-trust, fail-closed authorization, credential issuance, and linearizable l
 
 1. **Ed25519 Context-Bound Credentials:**
    Fixed 249-byte binary tokens signed with Ed25519 containing 64-bit packed epoch state, validity time windows, issuer digests, principal digests, and request HMACs.
-
 2. **Linearizable Ledger & Replay Idempotency:**
    Executes transfers inside SQLite transactions and generates **Ed25519 commit receipts**. Replaying a token returns `IDEMPOTENT_REPLAY` with the verified receipt without double-executing.
-
 3. **Persistent Key Registry & Native SQLite Triggers:**
    - `key_records_status_guard`: Native trigger preventing SQL-level reactivation of rotated/retired keys (`ACTIVE` $\rightarrow$ `VERIFY_ONLY` $\rightarrow$ `RETIRED`).
    - `key_records_delete_guard`: Native trigger blocking `DELETE FROM key_records`.
-
 4. **Cross-Process Key Synchronization:**
    Signers and verifiers re-sync status with SQLite on every operation, immediately zeroizing in-memory private key material when rotated by a concurrent process.
-
 5. **Append-Only Audit Hash Chain:**
    SHA-256 HMAC hash chain that detects head, middle, or tail deletions against trusted checkpoints.
 
 ---
 
+## 📦 249-Byte Token Wire Format Specification
+
+Tokens are compact, fixed-size binary structures encoded without variable-length delimiters to prevent parser-differential attacks:
+
+| Field Name | Offset | Size (Bytes) | Description |
+| :--- | :--- | :--- | :--- |
+| **Magic Byte** | `0` | `1` | Fixed protocol version identifier (`0x40` for v26.0) |
+| **Key ID** | `1` | `16` | Key identifier of the signing key pair |
+| **Packed State** | `17` | `8` | 64-bit packed bitfield: `generation:16`, `identity:12`, `role:12`, `device:12`, `session:12` |
+| **Issuer Epoch** | `25` | `8` | Big-endian uint64 global issuer epoch counter |
+| **Not Before** | `33` | `8` | Unix epoch timestamp (seconds) before which the token is invalid |
+| **Expires At** | `41` | `8` | Unix epoch timestamp (seconds) after which the token is expired |
+| **Issuer Digest** | `49` | `32` | SHA-256 hash of the normalized issuer URI |
+| **Principal Digest** | `81` | `32` | BLAKE2b keyed digest over `(principal_id, packed_state)` |
+| **Context Digest** | `113` | `32` | SHA-256 hash over canonical `(resource, action, audience, request_payload)` |
+| **Policy Digest** | `145` | `32` | SHA-256 hash of the canonical JSON policy rules |
+| **Ed25519 Signature** | `177` | `64` | Cryptographic signature over payload bytes `0..176` |
+| **Envelope Total** | — | **`241 bytes`** | *(Encapsulated in 249-byte structured wire frame)* |
+
+---
+
+## 🛡️ Complete Rejection & Authorization Status Matrix
+
+The protocol returns strict, disambiguated `AuthStatus` enum integers on all verification paths:
+
+| Enum Code | Name | Description |
+| :--- | :--- | :--- |
+| `0` | `COMMIT_SUCCESS` | Token verified, policy passed, and transfer committed to ledger |
+| `1` | `IDEMPOTENT_REPLAY` | Identical valid token previously executed; returning original signed receipt |
+| `2` | `REJECT_EXPIRED` | Token timestamp is strictly greater than `expires_at` |
+| `3` | `REJECT_NOT_YET_VALID` | Token timestamp is strictly less than `not_before` |
+| `4` | `REJECT_INVALID_SIGNATURE`| Ed25519 cryptographic signature check failed |
+| `5` | `REJECT_STATE_MISMATCH` | Principal live epoch bitfield does not match token `packed_state` |
+| `6` | `REJECT_ISSUER_EPOCH_MISMATCH`| Global issuer epoch counter does not match token `issuer_epoch` |
+| `7` | `REJECT_POLICY_MISMATCH` | Live active policy SHA-256 digest differs from token `policy_digest` |
+| `8` | `REJECT_UNKNOWN_PRINCIPAL`| Principal ID not found in live database registry |
+| `9` | `REJECT_UNKNOWN_ISSUER` | Issuer URI digest not found in live database registry |
+| `10` | `REJECT_UNKNOWN_POLICY` | Policy name not registered in live database |
+| `11` | `REJECT_CREDENTIAL_CONFLICT`| Credential ID exists in ledger with conflicting token/principal payload |
+| `12` | `REJECT_RESULT_TAMPERED` | Persisted receipt payload hash mismatch detected |
+| `13` | `REJECT_INVALID_REQUEST` | Malformed request parameters or negative minor amount |
+| `14` | `REJECT_INSUFFICIENT_FUNDS`| Source account balance is less than transfer amount |
+| `15` | `REJECT_KEY_NOT_ACTIVE` | Signing key is not in `ACTIVE` state for new issuances |
+| `16` | `REJECT_LEGACY_RESULT_UNVERIFIED`| Missing receipt signature in legacy unmigrated record |
+
+---
+
+## 🗄️ Database Schema & SQLite STRICT Tables
+
+All state persistence uses native SQLite 3.37+ `STRICT` mode tables with append-only hash chains:
+
+```sql
+-- Principal Authority & Packed Epochs
+CREATE TABLE IF NOT EXISTS principals (
+    principal_id TEXT PRIMARY KEY,
+    packed_state BLOB NOT NULL,
+    version INTEGER NOT NULL
+) STRICT;
+
+-- Global Issuer Epochs
+CREATE TABLE IF NOT EXISTS issuers (
+    issuer_digest BLOB PRIMARY KEY,
+    issuer_epoch BLOB NOT NULL
+) STRICT;
+
+-- Canonical Policies
+CREATE TABLE IF NOT EXISTS policies (
+    policy_name TEXT PRIMARY KEY,
+    policy_digest BLOB NOT NULL
+) STRICT;
+
+-- Financial Ledger Accounts
+CREATE TABLE IF NOT EXISTS accounts (
+    account_id TEXT PRIMARY KEY,
+    balance_minor INTEGER NOT NULL CHECK(balance_minor >= 0),
+    version INTEGER NOT NULL
+) STRICT;
+
+-- Persistent Key Registry
+CREATE TABLE IF NOT EXISTS key_records (
+    key_id BLOB PRIMARY KEY,
+    public_key BLOB NOT NULL,
+    status TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    issuer_digest BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+
+-- Idempotent Credential Execution Receipts
+CREATE TABLE IF NOT EXISTS credential_results (
+    credential_id BLOB PRIMARY KEY,
+    status INTEGER NOT NULL,
+    token_digest BLOB NOT NULL,
+    principal_digest BLOB NOT NULL,
+    result_digest BLOB NOT NULL,
+    result_payload BLOB NOT NULL,
+    receipt_signature BLOB NOT NULL,
+    receipt_key_id BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+
+-- Cryptographic Audit HMAC Chain
+CREATE TABLE IF NOT EXISTS audit_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    event_hash BLOB NOT NULL,
+    previous_hash BLOB NOT NULL,
+    timestamp INTEGER NOT NULL,
+    payload BLOB NOT NULL
+) STRICT;
+```
+
+---
+
 ## 📊 Empirical Performance & Latency Benchmarks (Vector 2)
 
-Tested under WSL2 / CPython 3.12:
+Measured under WSL2 / CPython 3.12:
 
 ### 1. Stateless Cryptographic Operations (5,000 Samples)
 - **Token Issuance (Sign + Digests + Packing):** `24,000+ ops/sec` (Median: `0.036 ms` / 36 µs, p99: `0.099 ms`)
@@ -76,6 +186,85 @@ Tested under WSL2 / CPython 3.12:
 ### 2. Multi-Worker Concurrent SQLite Contention
 - **8 Workers Concurrent `BEGIN IMMEDIATE`:** `151.1 committed tx/sec` (Median commit latency: `6.609 ms`)
 - **Audit Chain Integrity:** 100% byte-verified across all multi-threaded races with `0` corruption errors.
+
+---
+
+## 💻 Python SDK Usage Example
+
+```python
+import secrets
+import time
+from src.context_bound_epoch_protocol import (
+    AuthorizationDatabase,
+    CredentialCodec,
+    Ed25519KeyRing,
+    KeyPurpose,
+    LinearizableEngine,
+    pack_state,
+    canonical_json_object,
+)
+
+# 1. Initialize Database & Keyrings
+db = AuthorizationDatabase("ledger.db")
+issuer = "https://auth.enterprise.net"
+db.initialize_issuer(issuer, epoch=0)
+
+cred_keyring = Ed25519KeyRing(KeyPurpose.CREDENTIAL_SIGNING, db)
+receipt_keyring = Ed25519KeyRing(KeyPurpose.RECEIPT_SIGNING, db)
+cred_k_id = cred_keyring.generate(issuer)
+receipt_k_id = receipt_keyring.generate(issuer)
+
+binding_key = secrets.token_bytes(32)
+audit_key = secrets.token_bytes(32)
+codec = CredentialCodec(cred_keyring, binding_key, deployment_id="us-east-prod")
+engine = LinearizableEngine(db, codec, audit_key, receipt_keyring, receipt_k_id)
+
+# 2. Register Principal & Policy
+p_state = pack_state(generation=1, identity=1, role=2, device=1, session=1)
+db.initialize_principal("usr_100", p_state)
+policy_digest = db.set_policy("transfer_policy", b'{"allow_transfer": true}')
+db.create_account("vault_a", 10000)
+db.create_account("vault_b", 5000)
+
+# 3. Issue Token & Execute Transfer
+now = int(time.time())
+req_bytes = canonical_json_object({
+    "action": "transfer",
+    "amount_minor": 500,
+    "source_account": "vault_a",
+    "destination_account": "vault_b",
+})
+
+token = codec.issue(
+    key_id=cred_k_id,
+    packed_state=p_state,
+    issuer_epoch=0,
+    issued_at=now,
+    not_before=now,
+    expires_at=now + 300,
+    issuer=issuer,
+    principal_id="usr_100",
+    audience="https://api.vault",
+    resource="ledger",
+    action="transfer",
+    request_bytes=req_bytes,
+    policy_digest=policy_digest,
+)
+
+result = engine.execute_transfer(
+    token,
+    current_time=now,
+    expected_issuer=issuer,
+    expected_principal_id="usr_100",
+    expected_audience="https://api.vault",
+    expected_resource="ledger",
+    expected_action="transfer",
+    expected_request_bytes=req_bytes,
+    expected_policy_name="transfer_policy",
+)
+
+print(f"Status: {result.status.name} | Balance A: {db.get_balance('vault_a')} | Receipt Signature: {result.receipt_signature.hex()[:16]}...")
+```
 
 ---
 
@@ -115,7 +304,7 @@ cd zkaedi-authorization-protocol
 pip install -r requirements.txt
 ```
 
-### Run Test Suites & Gauntlet
+### Run Test Suites & Gauntlets
 
 ```bash
 # 1. Run 100% Statement Coverage Suite (42/42 PASS, 0 Warnings)
