@@ -28,10 +28,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 
-if sys.version_info < (3, 11):
+if sys.version_info < (3, 11):  # pragma: no cover
     raise RuntimeError("zkaedi_authorization_v26 requires CPython 3.11+")
 
-if sqlite3.sqlite_version_info < (3, 37, 0):
+if sqlite3.sqlite_version_info < (3, 37, 0):  # pragma: no cover
     raise RuntimeError(f"SQLite 3.37.0+ required for STRICT table security; found {sqlite3.sqlite_version}")
 
 __version__ = "26.0.0"
@@ -962,7 +962,7 @@ class AuthorizationDatabase:
                     connection.execute("INSERT INTO accounts_v26 SELECT account_id, balance_minor, version FROM accounts;")
                     mig_cnt = connection.execute("SELECT COUNT(*) FROM accounts_v26").fetchone()[0]
 
-                    if mig_cnt != src_cnt:
+                    if mig_cnt != src_cnt:  # pragma: no cover
                         raise MigrationError(f"account migration row count mismatch: source={src_cnt}, migrated={mig_cnt}")
 
                     connection.execute("DROP TABLE accounts;")

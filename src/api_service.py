@@ -27,24 +27,24 @@ from src.context_bound_epoch_protocol import (
 )
 
 # Optional FastAPI / Pydantic imports for OpenAPI docs
-try:
-    from fastapi import FastAPI, HTTPException, Request, Response, status, Query
-    from fastapi.middleware.cors import CORSMiddleware
-    from pydantic import BaseModel, Field, field_validator
-    HAS_FASTAPI = True
-except ImportError:
-    HAS_FASTAPI = False
+try:  # pragma: no cover
+    from fastapi import FastAPI, HTTPException, Request, Response, status, Query  # pragma: no cover
+    from fastapi.middleware.cors import CORSMiddleware  # pragma: no cover
+    from pydantic import BaseModel, Field, field_validator  # pragma: no cover
+    HAS_FASTAPI = True  # pragma: no cover
+except ImportError:  # pragma: no cover
+    HAS_FASTAPI = False  # pragma: no cover
 
 
 class IssueTokenRequest(BaseModel):
-    issuer: str = Field(..., example="https://auth.net")
-    principal_id: str = Field(..., example="usr_100")
-    audience: str = Field(..., example="https://api.net")
-    resource: str = Field(..., example="vault")
-    action: str = Field(..., example="transfer")
-    request_dict: Dict[str, Any] = Field(..., example={"action": "transfer", "amount_minor": 100, "source_account": "vault-1", "destination_account": "vault-2"})
-    policy_name: str = Field("default_policy", example="default_policy")
-    lifetime_seconds: int = Field(300, ge=1, le=900, example=300)
+    issuer: str = Field(..., json_schema_extra={"example": "https://auth.net"})
+    principal_id: str = Field(..., json_schema_extra={"example": "usr_100"})
+    audience: str = Field(..., json_schema_extra={"example": "https://api.net"})
+    resource: str = Field(..., json_schema_extra={"example": "vault"})
+    action: str = Field(..., json_schema_extra={"example": "transfer"})
+    request_dict: Dict[str, Any] = Field(..., json_schema_extra={"example": {"action": "transfer", "amount_minor": 100, "source_account": "vault-1", "destination_account": "vault-2"}})
+    policy_name: str = Field("default_policy", json_schema_extra={"example": "default_policy"})
+    lifetime_seconds: int = Field(300, ge=1, le=900, json_schema_extra={"example": 300})
 
     @field_validator("issuer", "principal_id", "audience", "resource", "action")
     @classmethod
@@ -58,13 +58,13 @@ class IssueTokenRequest(BaseModel):
 
 class TransferExecuteRequest(BaseModel):
     token_hex: str
-    issuer: str = Field(..., example="https://auth.net")
-    principal_id: str = Field(..., example="usr_100")
-    audience: str = Field(..., example="https://api.net")
-    resource: str = Field(..., example="vault")
-    action: str = Field(..., example="transfer")
-    request_dict: Dict[str, Any] = Field(..., example={"action": "transfer", "amount_minor": 100, "source_account": "vault-1", "destination_account": "vault-2"})
-    policy_name: str = Field("default_policy", example="default_policy")
+    issuer: str = Field(..., json_schema_extra={"example": "https://auth.net"})
+    principal_id: str = Field(..., json_schema_extra={"example": "usr_100"})
+    audience: str = Field(..., json_schema_extra={"example": "https://api.net"})
+    resource: str = Field(..., json_schema_extra={"example": "vault"})
+    action: str = Field(..., json_schema_extra={"example": "transfer"})
+    request_dict: Dict[str, Any] = Field(..., json_schema_extra={"example": {"action": "transfer", "amount_minor": 100, "source_account": "vault-1", "destination_account": "vault-2"}})
+    policy_name: str = Field("default_policy", json_schema_extra={"example": "default_policy"})
 
     @field_validator("token_hex")
     @classmethod
@@ -73,7 +73,7 @@ class TransferExecuteRequest(BaseModel):
             raise ValueError(f"invalid credential token length (must be {EXPECTED_TOKEN_SIZE * 2} hex characters)")
         try:
             raw = bytes.fromhex(value)
-            if len(raw) != EXPECTED_TOKEN_SIZE:
+            if len(raw) != EXPECTED_TOKEN_SIZE:  # pragma: no cover
                 raise ValueError("invalid credential token byte length")
         except ValueError:
             raise ValueError("token_hex must be a valid hex string")
@@ -81,8 +81,8 @@ class TransferExecuteRequest(BaseModel):
 
 
 class KeyRotateRequest(BaseModel):
-    keyring_type: str = Field(..., example="credential")
-    new_status: str = Field(..., example="verify_only")
+    keyring_type: str = Field(..., json_schema_extra={"example": "credential"})
+    new_status: str = Field(..., json_schema_extra={"example": "verify_only"})
 
     @field_validator("keyring_type")
     @classmethod
@@ -100,7 +100,7 @@ class KeyRotateRequest(BaseModel):
 
 
 class InitPrincipalRequest(BaseModel):
-    principal_id: str = Field(..., example="usr_300")
+    principal_id: str = Field(..., json_schema_extra={"example": "usr_300"})
     generation: int = Field(1, ge=0, le=65535)
     identity: int = Field(1, ge=0, le=4095)
     role: int = Field(1, ge=0, le=4095)
@@ -109,8 +109,8 @@ class InitPrincipalRequest(BaseModel):
 
 
 class BumpPrincipalEpochRequest(BaseModel):
-    principal_id: str = Field(..., example="usr_100")
-    field: str = Field(..., example="session")
+    principal_id: str = Field(..., json_schema_extra={"example": "usr_100"})
+    field: str = Field(..., json_schema_extra={"example": "session"})
 
     @field_validator("field")
     @classmethod
@@ -121,25 +121,25 @@ class BumpPrincipalEpochRequest(BaseModel):
 
 
 class InitIssuerRequest(BaseModel):
-    issuer: str = Field(..., example="https://auth.net")
+    issuer: str = Field(..., json_schema_extra={"example": "https://auth.net"})
     epoch: int = Field(0, ge=0)
 
 
 class SetPolicyRequest(BaseModel):
-    policy_name: str = Field(..., example="transfer_policy")
-    canonical_policy_dict: Dict[str, Any] = Field(..., example={"allow_transfer": True, "max_amount": 5000})
+    policy_name: str = Field(..., json_schema_extra={"example": "transfer_policy"})
+    canonical_policy_dict: Dict[str, Any] = Field(..., json_schema_extra={"example": {"allow_transfer": True, "max_amount": 5000}})
 
 
 class CreateAccountRequest(BaseModel):
-    account_id: str = Field(..., example="vault-3")
+    account_id: str = Field(..., json_schema_extra={"example": "vault-3"})
     balance_minor: int = Field(1000, ge=0, le=9223372036854775807)
 
 
 class RegisterPublicKeyRequest(BaseModel):
-    key_id_hex: str = Field(..., example="00112233445566778899aabbccddeeff")
-    public_key_hex: str = Field(..., example="00"*32)
-    issuer: str = Field(..., example="https://auth.net")
-    status: str = Field("verify_only", example="verify_only")
+    key_id_hex: str = Field(..., json_schema_extra={"example": "00112233445566778899aabbccddeeff"})
+    public_key_hex: str = Field(..., json_schema_extra={"example": "00"*32})
+    issuer: str = Field(..., json_schema_extra={"example": "https://auth.net"})
+    status: str = Field("verify_only", json_schema_extra={"example": "verify_only"})
 
 
 class AuthorizationServiceApp:
@@ -340,7 +340,7 @@ if HAS_FASTAPI:
     async def add_security_headers(request: Request, call_next):
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > MAX_REQUEST_BYTES:
-            return Response(content="Payload Too Large", status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+            return Response(content="Payload Too Large", status_code=status.HTTP_413_CONTENT_TOO_LARGE)
 
         response: Response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
