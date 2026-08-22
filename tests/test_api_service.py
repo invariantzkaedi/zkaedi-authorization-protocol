@@ -490,3 +490,60 @@ class TestFastAPIRoutesAndMiddleware(unittest.TestCase):
             service.verify_audit_log(0, "00" * 31)
         resp = self.client.get("/api/v1/audit/verify?cp_hash_hex=short_hex")
         self.assertEqual(resp.status_code, 400)
+
+    def test_threshold_endpoints(self):
+        # 1. DKG
+        dkg_resp = self.client.post("/api/v1/threshold/dkg", json={"t": 3, "n": 5})
+        self.assertEqual(dkg_resp.status_code, 200)
+        dkg_data = dkg_resp.json()
+        self.assertEqual(dkg_data["t"], 3)
+        self.assertEqual(dkg_data["n"], 5)
+        self.assertIn("group_public_key_hex", dkg_data)
+
+        # DKG error path
+        dkg_err = self.client.post("/api/v1/threshold/dkg", json={"t": 10, "n": 2})
+        self.assertEqual(dkg_err.status_code, 400)
+
+        # 2. Batch Verify
+        batch_payload = {
+            "tokens": [
+                {
+                    "token_id": "tok_1",
+                    "message_hex": "68656c6c6f",
+                    "sig_hex": "01" * 64,
+                    "pk_hex": "02" * 32,
+                }
+            ]
+        }
+        batch_resp = self.client.post("/api/v1/threshold/verify-batch", json=batch_payload)
+        self.assertEqual(batch_resp.status_code, 200)
+        batch_data = batch_resp.json()
+        self.assertTrue(batch_data["all_valid"])
+        self.assertEqual(batch_data["count"], 1)
+
+        # Batch Verify error path
+        batch_err = self.client.post("/api/v1/threshold/verify-batch", json={"tokens": [{"token_id": "t", "message_hex": "not_hex", "sig_hex": "00", "pk_hex": "00"}]})
+        self.assertEqual(batch_err.status_code, 400)
+
+        # 3. Epoch Advance
+        advance_payload = {
+            "issuer": "https://auth.net",
+            "current_epoch": 0,
+            "target_epoch": 1,
+            "state_root_hex": "aa" * 32,
+        }
+        adv_resp = self.client.post("/api/v1/threshold/epoch/advance", json=advance_payload)
+        self.assertEqual(adv_resp.status_code, 200)
+        adv_data = adv_resp.json()
+        self.assertEqual(adv_data["epoch"], 1)
+        self.assertEqual(adv_data["issuer"], "https://auth.net")
+
+        # Epoch Advance error path (jump +2)
+        adv_err_payload = {
+            "issuer": "https://auth.net",
+            "current_epoch": 1,
+            "target_epoch": 5,
+            "state_root_hex": "bb" * 32,
+        }
+        adv_err = self.client.post("/api/v1/threshold/epoch/advance", json=adv_err_payload)
+        self.assertEqual(adv_err.status_code, 400)

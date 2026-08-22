@@ -25,6 +25,10 @@ from src.context_bound_epoch_protocol import (
     _field_digest,
     pack_state,
 )
+from src.crypto.dkg import run_dkg
+from src.crypto.batch_verifier import CredentialToken, verify_token_batch_simd
+from src.crypto.frost_signer import FROSTParticipant
+from src.epoch_manager import EpochManager, EpochAdvanceRequest
 
 # Optional FastAPI / Pydantic imports for OpenAPI docs
 try:  # pragma: no cover
@@ -140,6 +144,22 @@ class RegisterPublicKeyRequest(BaseModel):
     public_key_hex: str = Field(..., json_schema_extra={"example": "00"*32})
     issuer: str = Field(..., json_schema_extra={"example": "https://auth.net"})
     status: str = Field("verify_only", json_schema_extra={"example": "verify_only"})
+
+
+class DKGInitiateRequest(BaseModel):
+    t: int = Field(3, ge=1, le=100)
+    n: int = Field(5, ge=1, le=100)
+
+
+class BatchVerifyRequest(BaseModel):
+    tokens: list[Dict[str, str]] = Field(..., json_schema_extra={"example": [{"token_id": "tok_1", "message_hex": "68656c6c6f", "sig_hex": "00"*64, "pk_hex": "00"*32}]})
+
+
+class ThresholdEpochAdvanceRequest(BaseModel):
+    issuer: str = Field(..., json_schema_extra={"example": "https://auth.net"})
+    current_epoch: int = Field(0, ge=0)
+    target_epoch: int = Field(1, ge=1)
+    state_root_hex: str = Field("00"*32)
 
 
 class AuthorizationServiceApp:
@@ -321,6 +341,57 @@ class AuthorizationServiceApp:
             "latest_hash": latest_hash.hex(),
         }
 
+    # THRESHOLD CRYPTO SERVICE METHODS
+    def initiate_dkg(self, req: DKGInitiateRequest) -> Dict[str, Any]:
+        tr = run_dkg(req.t, req.n)
+        return {
+            "t": tr.t,
+            "n": tr.n,
+            "qual_nodes": sorted(list(tr.qual)),
+            "group_public_key_hex": tr.group_public_key.hex() if tr.group_public_key else "",
+            "verification_shares_count": len(tr.verification_shares),
+        }
+
+    def verify_batch(self, req: BatchVerifyRequest) -> Dict[str, Any]:
+        tokens = []
+        for item in req.tokens:
+            tok = CredentialToken(
+                token_id=item.get("token_id", "tok"),
+                message=bytes.fromhex(item.get("message_hex", "")),
+                signature=bytes.fromhex(item.get("sig_hex", "")),
+                public_key=bytes.fromhex(item.get("pk_hex", "")),
+            )
+            tokens.append(tok)
+        all_valid, amortized_us, invalid_indices = verify_token_batch_simd(tokens)
+        return {
+            "all_valid": all_valid,
+            "count": len(tokens),
+            "amortized_latency_us": round(amortized_us, 4),
+            "invalid_indices": invalid_indices,
+        }
+
+    def advance_threshold_epoch(self, req: ThresholdEpochAdvanceRequest) -> Dict[str, Any]:
+        tr = run_dkg(3, 5)
+        mgr = EpochManager(tr, 3, db_path=str(self.db_path))
+        parts = [
+            FROSTParticipant(i, i * 100, tr.verification_shares.get(i, b"\x00"*32))
+            for i in range(1, 4)
+        ]
+        advance_req = EpochAdvanceRequest(
+            issuer_id=req.issuer,
+            current_epoch=req.current_epoch,
+            target_epoch=req.target_epoch,
+            state_root=bytes.fromhex(req.state_root_hex),
+        )
+        cert = mgr.request_advance(advance_req, parts)
+        return {
+            "issuer": cert.issuer_id,
+            "epoch": cert.epoch,
+            "signature_hex": cert.signature.to_bytes().hex(),
+            "signers": sorted(list(cert.signer_ids)),
+            "issued_at": cert.issued_at,
+        }
+
     def cleanup(self) -> None:
         if self._temp_dir:
             self._temp_dir.cleanup()
@@ -449,6 +520,28 @@ if HAS_FASTAPI:
     def api_purge_expired_receipts():
         try:
             return service.purge_expired_receipts()
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    # THRESHOLD CRYPTO ENDPOINTS
+    @app.post("/api/v1/threshold/dkg")
+    def api_initiate_dkg(req: DKGInitiateRequest):
+        try:
+            return service.initiate_dkg(req)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    @app.post("/api/v1/threshold/verify-batch")
+    def api_verify_batch(req: BatchVerifyRequest):
+        try:
+            return service.verify_batch(req)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    @app.post("/api/v1/threshold/epoch/advance")
+    def api_advance_threshold_epoch(req: ThresholdEpochAdvanceRequest):
+        try:
+            return service.advance_threshold_epoch(req)
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
