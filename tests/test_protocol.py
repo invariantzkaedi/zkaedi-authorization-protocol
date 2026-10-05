@@ -110,6 +110,14 @@ class TestV26MasterCumulativeSuite(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_empty_audit_chain_genesis_checkpoint(self):
+        valid, count, latest_hash = self.db.verify_audit_log(
+            self.audit_key, trusted_checkpoint=(0, b"\x00" * 32)
+        )
+        self.assertTrue(valid)
+        self.assertEqual(count, 0)
+        self.assertEqual(latest_hash, b"\x00" * 32)
+
     def test_v24_legacy_database_migration_to_v26(self):
         """3. Asserts real v24 legacy database migration installs UNIQUE(public_key) and delete guard triggers."""
         v24_db_path = Path(self.temp_dir.name) / "v24_legacy.db"
@@ -125,6 +133,12 @@ class TestV26MasterCumulativeSuite(unittest.TestCase):
             CREATE TABLE audit_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, previous_hash BLOB NOT NULL CHECK(length(previous_hash) = 32), event_hash BLOB NOT NULL CHECK(length(event_hash) = 32), payload BLOB NOT NULL) STRICT;
             PRAGMA user_version = 24;
         """)
+        legacy_digest = secrets.token_bytes(32)
+        conn.execute(
+            "INSERT INTO policies(policy_name, policy_digest) VALUES(?, ?)",
+            ("legacy_policy", legacy_digest),
+        )
+        conn.commit()
         conn.close()
 
         # Instantiate AuthorizationDatabase on legacy v24 DB file -> Triggers migration to v26
@@ -133,6 +147,11 @@ class TestV26MasterCumulativeSuite(unittest.TestCase):
         try:
             ver = conn2.execute("PRAGMA user_version").fetchone()[0]
             self.assertEqual(ver, 27)
+            migrated_policy = conn2.execute(
+                "SELECT policy_digest, canonical_policy FROM policies WHERE policy_name = ?",
+                ("legacy_policy",),
+            ).fetchone()
+            self.assertEqual(migrated_policy, (legacy_digest, None))
 
             sql_row = conn2.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='key_records'").fetchone()[0]
             self.assertIn("UNIQUE", sql_row)

@@ -7,7 +7,7 @@
 [![Adversarial Fuzzing: 10,000 PASS](https://img.shields.io/badge/fuzzing-10%2C000%20mutations-success.svg)](tests/fuzz_adversarial_gauntlet.py)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A zero-trust, fail-closed authorization, credential issuance, and linearizable ledger transaction engine written in Python and backed by SQLite 3.37+ in `STRICT` mode.
+A fail-closed authorization, credential issuance, and linearizable ledger transaction engine written in Python and backed by SQLite 3.37+ `STRICT` tables. Audit events use a tamper-evident HMAC chain; the audit table itself is not protected by an append-only SQLite trigger.
 
 ---
 
@@ -55,7 +55,7 @@ A zero-trust, fail-closed authorization, credential issuance, and linearizable l
    - `key_records_status_guard`: Native trigger preventing SQL-level reactivation of rotated/retired keys (`ACTIVE` $\rightarrow$ `VERIFY_ONLY` $\rightarrow$ `RETIRED`).
    - `key_records_delete_guard`: Native trigger blocking `DELETE FROM key_records`.
 4. **Cross-Process Key Synchronization:**
-   Signers and verifiers re-sync status with SQLite on every operation, immediately zeroizing in-memory private key material when rotated by a concurrent process.
+   Signers and verifiers re-sync status with SQLite on every operation and drop cached private-key references after concurrent rotation. Python object-reference removal is not a guarantee of physical memory zeroization.
 5. **HMAC Audit Hash Chain:**
    SHA-256 HMAC chain detects modified events and deletions relative to a separately trusted checkpoint.
 
@@ -96,7 +96,7 @@ The exact values are defined by `AuthStatus` in `src/context_bound_epoch_protoco
 
 ## 🗄️ Database Schema & SQLite STRICT Tables
 
-All state persistence uses native SQLite 3.37+ `STRICT` mode tables with append-only hash chains:
+State persistence uses SQLite 3.37+ `STRICT` tables; audit events are linked by a tamper-evident HMAC chain:
 
 ```sql
 -- Principal Authority & Packed Epochs
@@ -116,7 +116,7 @@ CREATE TABLE IF NOT EXISTS issuers (
 CREATE TABLE IF NOT EXISTS policies (
     policy_name TEXT PRIMARY KEY,
 policy_digest BLOB NOT NULL,
-canonical_policy BLOB NOT NULL
+canonical_policy BLOB
 ) STRICT;
 
 -- Financial Ledger Accounts
@@ -159,14 +159,14 @@ CREATE TABLE IF NOT EXISTS audit_events (
 ) STRICT;
 ```
 
-Database schema migrations advance the SQLite `user_version` to 27. Existing policies created before schema 27 have no stored canonical rule body and fail closed at transfer time until each is set again through `/api/v1/policy/set`.
+Database schema migrations advance the SQLite `user_version` to 27. Existing policies created before schema 27 keep their digest but have no stored canonical rule body; those policies fail closed at transfer time until each is set again through `/api/v1/policy/set`.
 
 ### Transfer policy format
 
 Policies are canonical JSON objects supporting only:
 
 - `allow_transfer`: optional boolean; defaults to `true`.
-- `max_amount_minor`: optional positive integer upper bound per transfer.
+- `max_amount_minor`: optional positive signed-64-bit integer upper bound per transfer.
 
 Unknown fields and invalid types are rejected when setting a policy. The policy body is persisted along with its digest and evaluated against each transfer after the live digest check.
 
@@ -304,7 +304,7 @@ pip install -r requirements.txt
 ### Run Test Suites & Gauntlets
 
 ```bash
-# 1. Run 100% Statement Coverage Suite (42/42 PASS, 0 Warnings)
+# 1. Run statement coverage suite
 pytest -v --cov=src --cov-report=term-missing --cov-fail-under=100 tests/
 
 # 2. Run 10,000 Mutation Adversarial Fuzz Gauntlet
@@ -328,11 +328,11 @@ export ZKAEDI_API_AUDITOR_TOKEN="$(python -c 'import secrets; print(secrets.toke
 export ZKAEDI_API_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
 ```
 
-Send the configured token in the `Authorization` header using the `Bearer` authentication scheme. Client credentials authorize issuance, transfer, and balance reads; auditor credentials authorize audit verification; admin credentials authorize all `/api/v1` operations. Missing/weak server configuration fails closed (503); missing credentials return 401 and insufficient roles return 403. `/health` is public. HSTS is only a response header: terminate TLS at a correctly configured trusted proxy or serve TLS directly, and do not expose this local development configuration publicly. The service currently generates signing/binding/audit keys at startup; stable production key custody and restoration are not implemented, so the service is not production-ready.
+Send the configured token in the `Authorization` header using the `Bearer` authentication scheme. Client credentials authorize issuance, transfer, and balance reads; auditor credentials authorize audit verification; admin credentials authorize all `/api/v1` operations. Missing/weak server configuration fails closed (503); missing credentials return 401 and insufficient roles return 403. `/health` is public. This protects the REST routes only; direct in-process calls to the Python service/database objects bypass HTTP authentication. HSTS is only a response header: terminate TLS at a correctly configured trusted proxy or serve TLS directly, and do not expose this local development configuration publicly. The service currently generates signing/binding/audit keys at startup; stable production key custody and restoration are not implemented, so the service is not production-ready.
 
-The threshold DKG, threshold epoch, and previously experimental batch-verification REST operations return HTTP 501 until their threshold protocols have independent, real cryptographic implementations. `src/lockfree_memory_vault.py` is a state prefilter only; it never authorizes a token because it does not verify the Ed25519 signature.
+The threshold DKG, threshold epoch, and previously experimental batch-verification REST operations return HTTP 501 until their threshold protocols have independent, real cryptographic implementations. Low-level DKG/FROST/BLS/slashing helpers are research scaffolds, not security primitives: share/pairing checks fail closed and threshold signing is disabled. The standalone batch verifier performs independent Ed25519 checks, not SIMD or aggregate verification. `src/lockfree_memory_vault.py` is a state prefilter only; it never authorizes a token because it does not verify the Ed25519 signature. The `src/micro_agents/` utilities are also separate prototypes and are not part of the authorization decision path.
 
-For production deployment, additionally define a managed secret/key provider and rotation/recovery process, TLS and proxy policy, encrypted backups and tested restore, schema migration roll-forward/rollback procedures, monitoring/alerting, and incident response. The bundled service does not implement these deployment controls.
+For production deployment, additionally define a managed secret/key provider and rotation/recovery process, TLS and proxy policy, encrypted backups and tested restore, schema migration roll-forward/rollback procedures, monitoring/alerting, and incident response. Audit records for administrative API operations are appended after the operation in a separate transaction, so an audit failure does not roll back that operation. Persist trusted audit checkpoints outside the database. The bundled service does not implement these deployment controls.
 
 Inspect interactive OpenAPI documentation at `http://127.0.0.1:8000/docs` only in a trusted development environment.
 

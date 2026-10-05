@@ -350,8 +350,8 @@ def validate_transfer_policy(policy_bytes: bytes) -> dict[str, Any]:
         raise ValueError("allow_transfer must be a boolean")
     if "max_amount_minor" in policy:
         limit = policy["max_amount_minor"]
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-            raise ValueError("max_amount_minor must be a positive integer")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_TIMESTAMP:
+            raise ValueError("max_amount_minor must be a positive signed 64-bit integer")
     return policy
 
 
@@ -843,7 +843,7 @@ CREATE TABLE IF NOT EXISTS issuers (
 CREATE TABLE IF NOT EXISTS policies (
     policy_name TEXT PRIMARY KEY,
     policy_digest BLOB NOT NULL CHECK(length(policy_digest) = 32),
-    canonical_policy BLOB NOT NULL CHECK(length(canonical_policy) > 0)
+    canonical_policy BLOB CHECK(canonical_policy IS NULL OR length(canonical_policy) > 0)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS accounts (
@@ -1125,6 +1125,19 @@ class AuthorizationDatabase:
 
                 if status not in ALLOWED_KEY_TRANSITIONS[old_st] and status != old_st:
                     raise ValueError(f"invalid persistent key transition in DB: {old_st.value} -> {status.value}")
+                if (
+                    purpose is KeyPurpose.RECEIPT_SIGNING
+                    and status is KeyStatus.RETIRED
+                    and old_st is not KeyStatus.RETIRED
+                ):
+                    receipt_count = connection.execute(
+                        "SELECT COUNT(*) FROM credential_results WHERE receipt_key_id = ? AND expires_at > ?",
+                        (key_id, int(time.time())),
+                    ).fetchone()[0]
+                    if receipt_count:
+                        raise ValueError(
+                            "receipt key cannot be retired while unexpired receipts reference it"
+                        )
 
             connection.execute(
                 "INSERT INTO key_records(key_id, public_key, purpose, issuer_digest, status) VALUES(?, ?, ?, ?, ?) "
@@ -1587,7 +1600,6 @@ class LinearizableEngine:
 
         if not isinstance(amount_minor, int) or isinstance(amount_minor, bool) or amount_minor <= 0:
             raise AuthorizationRejected(AuthStatus.REJECT_INVALID_REQUEST)
-
         if source_account == destination_account:
             raise AuthorizationRejected(AuthStatus.REJECT_INVALID_REQUEST)
 

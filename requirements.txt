@@ -4,3 +4,4 @@ pydantic>=2.0.0
 uvicorn>=0.22.0
 pytest>=8.0.0
 pytest-cov>=5.0.0
+httpx2>=2.0.0

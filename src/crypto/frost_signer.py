@@ -1,8 +1,4 @@
-"""
-ZKAEDI FROST — Two-Round Threshold Ed25519 (RFC 9591 style)
-Produces standard 64-byte Ed25519 signatures (R || S).
-100% compatible with existing 249-byte wire envelope.
-"""
+"""Experimental threshold-signing scaffold; no cryptographically valid FROST signatures are produced."""
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -71,29 +67,7 @@ class FROSTParticipant:
         signers: Set[int],
         group_public_key: bytes,
     ) -> SigningShare:
-        binding_list = b"".join(c.D + c.E for _, c in sorted(commitments.items()))
-        rho = _hash_to_scalar(self.id.to_bytes(4, "little"), message, binding_list)
-
-        # Compute Group Commitment R
-        r_hasher = hashlib.sha256(b"GROUP_COMMITMENT_R")
-        for j, c in sorted(commitments.items()):
-            r_hasher.update(c.D)
-            r_hasher.update(c.E)
-        R = r_hasher.digest()
-
-        # Challenge c = H(R || Q || m)
-        c = _hash_to_scalar(R, group_public_key, message)
-
-        # Lagrange coefficient
-        lam = _lagrange_coefficient(self.id, signers)
-
-        # z_i = d_i + e_i * ρ_i + λ_i * s_i * c mod ℓ
-        term1 = self.d or 0
-        term2 = ((self.e or 0) * rho) % L
-        term3 = (lam * self.s * c) % L
-        z = (term1 + term2 + term3) % L
-
-        return SigningShare(self.id, z)
+        raise NotImplementedError("threshold signing is disabled until real Ed25519 group operations are implemented")
 
 def frost_coordinate(
     participants: List[FROSTParticipant],
@@ -101,31 +75,5 @@ def frost_coordinate(
     group_public_key: bytes,
     t: int,
 ) -> FROSTSignature:
-    """Coordinator executes 2-round FROST threshold aggregation."""
-    assert len(participants) >= t
-    signers = {p.id for p in participants[:t]}
-    active = [p for p in participants if p.id in signers]
-
-    # Round 1: Collect Nonces
-    commitments = {}
-    for p in active:
-        commitments[p.id] = p.round1_nonce()
-
-    # Round 2: Collect Signature Shares
-    shares = []
-    for p in active:
-        sh = p.round2_sign(message, commitments, signers, group_public_key)
-        shares.append(sh)
-
-    # Aggregate S = Σ z_i mod ℓ
-    S_int = sum(sh.z for sh in shares) % L
-    S_bytes = S_int.to_bytes(32, "little")
-
-    # Reconstruct canonical R
-    r_hasher = hashlib.sha256(b"GROUP_COMMITMENT_R")
-    for j, c in sorted(commitments.items()):
-        r_hasher.update(c.D)
-        r_hasher.update(c.E)
-    R = r_hasher.digest()
-
-    return FROSTSignature(R=R, S=S_bytes)
+    """Raises rather than emitting a 64-byte value that only resembles a signature."""
+    raise NotImplementedError("threshold signing is disabled until real Ed25519 group operations are implemented")

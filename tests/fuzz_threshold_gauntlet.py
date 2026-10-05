@@ -12,6 +12,8 @@ import time
 import pytest
 import sqlite3
 from pathlib import Path
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 # Add src to path
 current_dir = Path(__file__).resolve().parent
@@ -71,19 +73,16 @@ def test_gauntlet_frost_01_rogue_share_slashed():
     assert len(rebalanced) == 3
 
 def test_gauntlet_frost_02_64byte_wire_compatibility():
-    """GAUNTLET-FROST-02: Emits canonical 64-byte Ed25519 signature."""
+    """GAUNTLET-FROST-02: Prototype signer fails closed instead of emitting a fake signature."""
     t, n = 3, 5
     transcript = run_dkg(t, n)
     participants = [
         FROSTParticipant(i, i * 1000 + 42, transcript.verification_shares.get(i, b"\x00"*32))
         for i in range(1, t + 1)
     ]
-    msg = b"ZKAEDI_CONTEXT_BOUND_CREDENTIAL_249B"
-    sig = frost_coordinate(participants, msg, transcript.group_public_key, t)
-    sig_bytes = sig.to_bytes()
-    assert len(sig_bytes) == 64
-    assert len(sig.R) == 32
-    assert len(sig.S) == 32
+    msg = b"ZKAEDI_CONTEXT_BOUND_CREDENTIAL_329B"
+    with pytest.raises(NotImplementedError):
+        frost_coordinate(participants, msg, transcript.group_public_key, t)
 
 def test_gauntlet_bls_01_pairing_aggregation():
     """GAUNTLET-BLS-01: Non-interactive threshold signature aggregation."""
@@ -93,12 +92,21 @@ def test_gauntlet_bls_01_pairing_aggregation():
     partials = [s.sign_partial(msg) for s in signers]
     agg = bls_aggregate_threshold(partials, t)
     assert len(agg.aggregated_point) == 32
-    assert bls_verify_pairing(agg, msg, b"\x01"*32)
+    assert not bls_verify_pairing(agg, msg, b"\x01"*32)
 
 def test_gauntlet_batch_01_simd_verification():
-    """GAUNTLET-BATCH-01: 1 Corrupted signature in 100 pack is accurately isolated."""
+    """GAUNTLET-BATCH-01: The Ed25519 verifier identifies the one malformed signature."""
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
     tokens = [
-        CredentialToken(f"tok_{i}", f"payload_{i}".encode(), b"\x01"*64, b"\x02"*32)
+        CredentialToken(
+            f"tok_{i}",
+            f"payload_{i}".encode(),
+            private_key.sign(f"payload_{i}".encode()),
+            public_key,
+        )
         for i in range(100)
     ]
     # Inject corruption at index 42
@@ -106,11 +114,11 @@ def test_gauntlet_batch_01_simd_verification():
 
     all_valid, amortized_us, invalid_idx = verify_token_batch_simd(tokens)
     assert not all_valid
-    assert 42 in invalid_idx
-    assert amortized_us < 5.0  # Sub-microsecond scale
+    assert invalid_idx == [42]
+    assert amortized_us >= 0
 
-def test_gauntlet_epoch_01_sqlite_rollback_rejected():
-    """GAUNTLET-EPOCH-01: SQLite STRICT trigger prevents non-monotonic epoch advancement."""
+def test_gauntlet_epoch_01_threshold_signing_fails_closed():
+    """GAUNTLET-EPOCH-01: No epoch certificate is persisted from prototype threshold signing."""
     t, n = 3, 5
     transcript = run_dkg(t, n)
     mgr = EpochManager(transcript, t, db_path=":memory:")
@@ -120,20 +128,11 @@ def test_gauntlet_epoch_01_sqlite_rollback_rejected():
         for i in range(1, t + 1)
     ]
 
-    # Advance Epoch 0 -> 1 (PASS)
+    # Threshold signing cannot create a certificate.
     req1 = EpochAdvanceRequest("issuer_zkaedi", 0, 1, b"\xaa"*32)
-    cert1 = mgr.request_advance(req1, participants)
-    assert cert1.epoch == 1
-
-    # Advance Epoch 1 -> 2 (PASS)
-    req2 = EpochAdvanceRequest("issuer_zkaedi", 1, 2, b"\xbb"*32)
-    cert2 = mgr.request_advance(req2, participants)
-    assert cert2.epoch == 2
-
-    # Attempt Rollback Epoch 2 -> 1 (MUST REJECT via Trigger)
-    req_bad = EpochAdvanceRequest("issuer_zkaedi", 2, 1, b"\xcc"*32)
-    with pytest.raises(Exception):
-        mgr.request_advance(req_bad, participants)
+    with pytest.raises(NotImplementedError):
+        mgr.request_advance(req1, participants)
+    assert mgr.db.execute("SELECT COUNT(*) FROM threshold_epoch_proofs").fetchone()[0] == 0
 
 def test_master_gauntlet_1000_iterations():
     """Master 1,000-iteration rapid adversarial gauntlet."""

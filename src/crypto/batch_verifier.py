@@ -1,18 +1,12 @@
-"""
-ZKAEDI Batch Verifier — Sub-Microsecond Vectorized Token Batch Compression
-Verifies batches of K credentials in parallel using windowed Straus / Bos-Coster MSM.
-"""
+"""Straightforward per-token Ed25519 verification; this is not SIMD or aggregate verification."""
 
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
-import hashlib
 import time
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
-L = 2**252 + 27742317777372353535851937790883648493
 
 @dataclass
 class CredentialToken:
@@ -23,7 +17,7 @@ class CredentialToken:
 
 def verify_token_batch_simd(tokens: List[CredentialToken]) -> Tuple[bool, float, List[int]]:
     """
-    Batch verification using random 128-bit linear combination coefficients.
+    Verifies each token independently with the cryptography library's Ed25519 verifier.
     Returns (all_valid, amortized_latency_us, invalid_indices).
     """
     if not tokens:

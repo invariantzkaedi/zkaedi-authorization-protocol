@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -26,6 +27,7 @@ from src.api_service import (
 from src.context_bound_epoch_protocol import (
     AuthStatus,
     EXPECTED_TOKEN_SIZE,
+    KeyStatus,
     MAX_REQUEST_BYTES,
 )
 
@@ -89,6 +91,18 @@ class TestAPIServiceFullCoverageIntegration(unittest.TestCase):
         replay_res = self.service.execute_transfer(transfer_req)
         self.assertEqual(replay_res["status"], AuthStatus.IDEMPOTENT_REPLAY.value)
 
+        self.service.receipt_keyring.transition(
+            self.service.receipt_key_id, KeyStatus.VERIFY_ONLY
+        )
+        with self.assertRaises(ValueError):
+            self.service.rotate_key(
+                KeyRotateRequest(keyring_type="receipt", new_status="retired")
+            )
+        with self.assertRaises(ValueError):
+            self.service.receipt_keyring.transition(
+                self.service.receipt_key_id, KeyStatus.RETIRED
+            )
+
         # 4. Verify Audit Log
         audit_res = self.service.verify_audit_log()
         self.assertTrue(audit_res["valid"])
@@ -118,7 +132,10 @@ class TestAPIServiceFullCoverageIntegration(unittest.TestCase):
 
     def test_policy_and_account_management_api(self):
         """3. Tests setting canonical policy, creating accounts, and checking balance APIs."""
-        set_pol_req = SetPolicyRequest(policy_name="custom_policy", canonical_policy_dict={"allow_transfer": True, "max": 1000})
+        set_pol_req = SetPolicyRequest(
+            policy_name="custom_policy",
+            canonical_policy_dict={"allow_transfer": True, "max_amount_minor": 1000},
+        )
         set_pol_res = self.service.set_policy(set_pol_req)
         self.assertEqual(set_pol_res["status"], "SET")
 
@@ -128,6 +145,12 @@ class TestAPIServiceFullCoverageIntegration(unittest.TestCase):
 
         bal_res = self.service.get_account_balance("vault-99")
         self.assertEqual(bal_res["balance_minor"], 5000)
+        for invalid_policy in (
+            b'{"allow_transfer":1}',
+            b'{"max_amount_minor":true}',
+        ):
+            with self.assertRaises(ValueError):
+                self.service.db.set_policy("invalid_policy", invalid_policy)
 
     def test_transfer_policy_is_enforced(self):
         policy_name = "limited_transfer"
@@ -163,6 +186,30 @@ class TestAPIServiceFullCoverageIntegration(unittest.TestCase):
         result = self.service.execute_transfer(transfer)
         self.assertEqual(result["status"], AuthStatus.REJECT_POLICY_MISMATCH.value)
         self.assertEqual(self.service.db.balance("vault-1"), 10000)
+        self.service.db.set_policy(policy_name, b'{"allow_transfer":false}')
+        denied_token = self.service.issue_token(issue)["token_hex"]
+        denied_transfer = transfer.model_copy(update={"token_hex": denied_token})
+        self.assertEqual(
+            self.service.execute_transfer(denied_transfer)["status"],
+            AuthStatus.REJECT_POLICY_MISMATCH.value,
+        )
+
+        for stored_policy in (b"{", None):
+            policy_digest = hashlib.sha256(stored_policy or b"{}").digest()
+            connection = self.service.db.connect()
+            try:
+                connection.execute(
+                    "UPDATE policies SET policy_digest = ?, canonical_policy = ? WHERE policy_name = ?",
+                    (policy_digest, stored_policy, policy_name),
+                )
+            finally:
+                connection.close()
+            bad_token = self.service.issue_token(issue)["token_hex"]
+            bad_transfer = transfer.model_copy(update={"token_hex": bad_token})
+            self.assertEqual(
+                self.service.execute_transfer(bad_transfer)["status"],
+                AuthStatus.REJECT_POLICY_MISMATCH.value,
+            )
 
     def test_keyring_public_register_can_retire_and_purge_api(self):
         """4. Tests public key registration, can-retire query, and receipt purging APIs."""
@@ -395,6 +442,10 @@ class TestFastAPIRoutesAndMiddleware(unittest.TestCase):
             "keyring_type": "receipt", "new_status": "verify_only"
         })
         self.assertEqual(resp.status_code, 200)
+        resp = self.client.post("/api/v1/keyring/rotate", json={
+            "keyring_type": "receipt", "new_status": "retired"
+        })
+        self.assertEqual(resp.status_code, 200)
 
         # Key rotate error -> 400
         with patch.object(service, "rotate_key", side_effect=ValueError("rotate error")):
@@ -590,8 +641,37 @@ class TestFastAPIRoutesAndMiddleware(unittest.TestCase):
         }
         adv_err = self.client.post("/api/v1/threshold/epoch/advance", json=adv_err_payload)
         self.assertEqual(adv_err.status_code, 501)
+        with patch.object(service, "initiate_dkg", side_effect=RuntimeError("failure")):
+            self.assertEqual(
+                self.client.post("/api/v1/threshold/dkg", json={"t": 3, "n": 5}).status_code,
+                400,
+            )
+        with patch.object(service, "verify_batch", side_effect=RuntimeError("failure")):
+            self.assertEqual(
+                self.client.post(
+                    "/api/v1/threshold/verify-batch", json={"tokens": []}
+                ).status_code,
+                400,
+            )
+        with patch.object(service, "advance_threshold_epoch", side_effect=RuntimeError("failure")):
+            self.assertEqual(
+                self.client.post(
+                    "/api/v1/threshold/epoch/advance", json=advance_payload
+                ).status_code,
+                400,
+            )
+
+    def test_invalid_content_length_rejected(self):
+        for content_length in ("invalid", "-1"):
+            response = self.client.post(
+                "/health",
+                content=b"",
+                headers={"Content-Length": content_length},
+            )
+            self.assertEqual(response.status_code, 400)
 
     def test_role_authentication_is_fail_closed(self):
+        unauthenticated = TestClient(app)
         issue_payload = {
             "issuer": "https://auth.net",
             "principal_id": "usr_100",
@@ -604,14 +684,41 @@ class TestFastAPIRoutesAndMiddleware(unittest.TestCase):
             "principal_id": "forbidden", "generation": 1, "identity": 1,
             "role": 1, "device": 1, "session": 1,
         }, headers={"Authorization": _authorization_header(self.tokens["client"])}).status_code, 403)
-        self.assertEqual(self.client.post(
-            "/api/v1/auth/issue", json=issue_payload, headers={}
+        self.assertEqual(unauthenticated.post(
+            "/api/v1/auth/issue", json=issue_payload
         ).status_code, 401)
         self.assertEqual(self.client.get(
             "/api/v1/audit/verify",
             headers={"Authorization": _authorization_header(self.tokens["client"])},
         ).status_code, 403)
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(self.client.post(
-                "/api/v1/auth/issue", json=issue_payload, headers={}
+            self.assertEqual(unauthenticated.post(
+                "/api/v1/auth/issue", json=issue_payload
             ).status_code, 503)
+        with patch.dict(
+            os.environ,
+            {"ZKAEDI_API_CLIENT_TOKEN": self.tokens["client"]},
+            clear=True,
+        ):
+            self.assertEqual(unauthenticated.post(
+                "/api/v1/principal/init",
+                json={
+                    "principal_id": "unconfigured-admin",
+                    "generation": 1,
+                    "identity": 1,
+                    "role": 1,
+                    "device": 1,
+                    "session": 1,
+                },
+            ).status_code, 503)
+
+        self.assertEqual(self.client.post(
+            "/api/v1/auth/issue",
+            json=issue_payload,
+            headers={"Authorization": _authorization_header("x" * 40)},
+        ).status_code, 401)
+
+    def test_audit_failure_rolls_back_audit_transaction(self):
+        with patch.object(service.db, "append_audit_log", side_effect=RuntimeError("audit unavailable")):
+            with self.assertRaises(RuntimeError):
+                service._record_audit("test", {})

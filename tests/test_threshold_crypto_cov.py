@@ -69,7 +69,7 @@ def test_dkg_node_methods_and_branches():
 
     # receive share and verify
     node.receive_share(sh)
-    assert node.verify_share(1, cmt)
+    assert not node.verify_share(1, cmt)
 
     # finalize secret with self and other
     node.received_shares[2] = 12345
@@ -143,9 +143,8 @@ def test_frost_participant_and_signature():
     assert len(nonce.D) == 32
     assert len(nonce.E) == 32
 
-    sh = p.round2_sign(b"msg", {1: nonce}, {1}, b"\xbb" * 32)
-    assert sh.node_id == 1
-    assert isinstance(sh.z, int)
+    with pytest.raises(NotImplementedError):
+        p.round2_sign(b"msg", {1: nonce}, {1}, b"\xbb" * 32)
 
     sig = FROSTSignature(b"\x11" * 32, b"\x22" * 32)
     assert len(sig.to_bytes()) == 64
@@ -157,8 +156,8 @@ def test_frost_coordinate_full():
         FROSTParticipant(1, 100, tr.verification_shares[1]),
         FROSTParticipant(2, 200, tr.verification_shares[2]),
     ]
-    sig = frost_coordinate(parts, b"hello", tr.group_public_key, 2)
-    assert len(sig.to_bytes()) == 64
+    with pytest.raises(NotImplementedError):
+        frost_coordinate(parts, b"hello", tr.group_public_key, 2)
 
 
 # ==============================================================================
@@ -176,7 +175,7 @@ def test_bls_aggregate_all_paths():
 
     agg = bls_aggregate_threshold([p1, p2], 2)
     assert agg.signers == {1, 2}
-    assert bls_verify_pairing(agg, b"msg1", b"\x01" * 32)
+    assert not bls_verify_pairing(agg, b"msg1", b"\x01" * 32)
 
     # Invalid point length check
     agg_bad = BLSAggregateSignature(b"\x00" * 16, {1, 2})
@@ -228,7 +227,7 @@ def test_slasher_all_branches():
     # Share deadbeef
     assert not slasher.verify_partial_share(1, 0xdeadbeef, b"", b"", b"", 0, 0, 0)
     # Valid share
-    assert slasher.verify_partial_share(1, 999, b"", b"", b"", 0, 0, 0)
+    assert not slasher.verify_partial_share(1, 999, b"", b"", b"", 0, 0, 0)
 
     # Slash node
     proof = slasher.slash_node(1, "s1", b"m", 0, b"\x01" * 32, b"\x02" * 32, b"\x03" * 32)
@@ -263,7 +262,7 @@ def test_epoch_manager_all_paths():
 
     # Invalid advance jump (+2)
     req_bad = EpochAdvanceRequest("iss_1", 0, 2, b"\xaa" * 32)
-    with pytest.raises(ValueError):
+    with pytest.raises(NotImplementedError):
         mgr.request_advance(req_bad, parts)
 
     # Threshold signing is disabled until backed by real group operations.
@@ -272,3 +271,20 @@ def test_epoch_manager_all_paths():
         mgr.request_advance(req_good, parts)
     cert_bad_sig = EpochCertificate("iss_1", 1, b"\xaa" * 32, FROSTSignature(b"\x00" * 16, b"\x00" * 16), {1}, 0)
     assert not mgr.verify_certificate(cert_bad_sig)
+    verifier_key = Ed25519PrivateKey.generate()
+    mgr.group_pk = verifier_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    unsigned = EpochCertificate(
+        "iss_1", 1, b"\xaa" * 32, FROSTSignature(b"", b""), {1}, 0
+    )
+    signature = verifier_key.sign(unsigned.message())
+    cert_valid = EpochCertificate(
+        unsigned.issuer_id,
+        unsigned.epoch,
+        unsigned.state_root,
+        FROSTSignature(signature[:32], signature[32:]),
+        unsigned.signer_ids,
+        unsigned.issued_at,
+    )
+    assert mgr.verify_certificate(cert_valid)

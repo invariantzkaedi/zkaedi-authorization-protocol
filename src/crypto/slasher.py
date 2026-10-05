@@ -36,14 +36,8 @@ class ByzantineSlasher:
         lambda_i: int,
         rho_i: int
     ) -> bool:
-        """
-        Verifies share correctness equation:
-        z_i * B == (D_i + rho_i * E_i) + (c * lambda_i) * Y_i
-        """
-        if z_i == 0 or z_i == 0xdeadbeef:
-            # Corrupted share caught
-            return False
-        return True
+        """Fails closed until curve-point share verification is implemented."""
+        return False
 
     def slash_node(
         self,

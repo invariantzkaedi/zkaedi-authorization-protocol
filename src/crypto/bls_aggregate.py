@@ -1,7 +1,4 @@
-"""
-ZKAEDI BLS Aggregate — BLS12-381 / BN254 Non-Interactive Threshold Signature Engine
-Provides non-interactive threshold signature aggregation and single-pairing verification.
-"""
+"""Experimental BLS data scaffold; it does not implement curve arithmetic or pairing verification."""
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -58,7 +55,5 @@ def bls_verify_pairing(
     message: bytes,
     group_public_key: bytes
 ) -> bool:
-    """Verifies bilinear pairing relation e(σ, G2) == e(H(m), PK)."""
-    if len(signature.aggregated_point) != 32:
-        return False
-    return True
+    """Fails closed because this module does not implement a bilinear pairing."""
+    return False

@@ -340,6 +340,12 @@ class AuthorizationServiceApp:
         target_key_id = self.cred_key_id if req.keyring_type == "credential" else self.receipt_key_id
         new_st = KeyStatus(req.new_status)
 
+        if (
+            req.keyring_type == "receipt"
+            and new_st is KeyStatus.RETIRED
+            and not self.db.can_retire_key(target_key_id, int(time.time()))
+        ):
+            raise ValueError("receipt key cannot be retired while unexpired receipts reference it")
         target_ring.transition(target_key_id, new_st)
         self._record_audit(
             "key_status_changed",
@@ -370,6 +376,7 @@ class AuthorizationServiceApp:
     def purge_expired_receipts(self) -> Dict[str, Any]:
         now = int(time.time())
         count = self.db.purge_expired_receipts(now)
+        self._record_audit("expired_receipts_purged", {"purged_count": count})
         return {"status": "PURGED", "purged_count": count}
 
     # 5. AUDIT LOG VERIFICATION
@@ -410,7 +417,7 @@ if HAS_FASTAPI:
 
     app = FastAPI(
         title="v26.0 Full-Coverage Authorization Microservice",
-        description="Complete REST API wrapping 100% of authorization engine operations, principal epochs, policy management, keyring lifecycle, and audit chains.",
+        description="REST API for supported authorization, ledger, policy, key lifecycle, and audit operations. Experimental threshold cryptography endpoints are disabled.",
         version=__version__,
     )
 
@@ -445,13 +452,20 @@ if HAS_FASTAPI:
             configured_tokens = {
                 role: token for role, token in configured_tokens.items() if token
             }
-            if not configured_tokens or any(len(token.encode("utf-8")) < 32 for token in configured_tokens.values()):
+            if not configured_tokens or any(
+                len(token.encode("utf-8")) < 32 or not token.isascii()
+                for token in configured_tokens.values()
+            ):
                 return Response(content="API authentication is not configured securely", status_code=503)
+            if required_role not in configured_tokens and "admin" not in configured_tokens:
+                return Response(content="Required API role is not configured", status_code=503)
             authorization = request.headers.get("authorization", "")
             supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
             matched_roles = {
                 role for role, token in configured_tokens.items()
-                if supplied and hmac.compare_digest(supplied, token)
+                if supplied and hmac.compare_digest(
+                    supplied.encode("utf-8"), token.encode("utf-8")
+                )
             }
             allowed = "admin" in matched_roles or required_role in matched_roles
             if not supplied:

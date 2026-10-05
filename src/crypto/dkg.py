@@ -1,7 +1,7 @@
 """
-ZKAEDI DKG — Dealerless Joint-Feldman / Pedersen Verifiable Secret Sharing
+Experimental DKG data-flow prototype; not a cryptographic DKG implementation.
 Produces group public key Q and per-node secret shares s_i with QUAL set.
-Zero trusted dealer. t-1 privacy. Complaint & disqualification support.
+Do not use generated commitments or shares for security decisions.
 """
 
 from __future__ import annotations
@@ -91,12 +91,8 @@ class DKGNode:
         self.received_shares[share.from_node] = share.value
 
     def verify_share(self, from_node: int, commitments: Commitment) -> bool:
-        """Verifies VSS commitment equation."""
-        s = self.received_shares.get(from_node)
-        if s is None:
-            return False
-        # VSS verification
-        return True
+        """Fails closed because this prototype does not implement VSS verification."""
+        return False
 
     def finalize_secret(self, qual: Set[int]) -> int:
         """s_i = Σ_{j ∈ QUAL} f_j(i) mod ℓ"""
