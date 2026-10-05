@@ -132,7 +132,7 @@ class TestV26MasterCumulativeSuite(unittest.TestCase):
         conn2 = migrated_db.connect()
         try:
             ver = conn2.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(ver, 26)
+            self.assertEqual(ver, 27)
 
             sql_row = conn2.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='key_records'").fetchone()[0]
             self.assertIn("UNIQUE", sql_row)

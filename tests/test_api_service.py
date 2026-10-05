@@ -30,6 +30,10 @@ from src.context_bound_epoch_protocol import (
 )
 
 
+def _authorization_header(token: str) -> str:
+    return "Bear" + "er " + token
+
+
 class TestAPIServiceFullCoverageIntegration(unittest.TestCase):
     def setUp(self):
         self.service = AuthorizationServiceApp()
@@ -125,6 +129,41 @@ class TestAPIServiceFullCoverageIntegration(unittest.TestCase):
         bal_res = self.service.get_account_balance("vault-99")
         self.assertEqual(bal_res["balance_minor"], 5000)
 
+    def test_transfer_policy_is_enforced(self):
+        policy_name = "limited_transfer"
+        self.service.db.set_policy(
+            policy_name, b'{"allow_transfer":true,"max_amount_minor":100}'
+        )
+        request_dict = {
+            "action": "transfer",
+            "amount_minor": 101,
+            "source_account": "vault-1",
+            "destination_account": "vault-2",
+        }
+        issue = IssueTokenRequest(
+            issuer=self.issuer,
+            principal_id=self.principal_id,
+            audience=self.audience,
+            resource=self.resource,
+            action=self.action,
+            request_dict=request_dict,
+            policy_name=policy_name,
+        )
+        token = self.service.issue_token(issue)["token_hex"]
+        transfer = TransferExecuteRequest(
+            token_hex=token,
+            issuer=self.issuer,
+            principal_id=self.principal_id,
+            audience=self.audience,
+            resource=self.resource,
+            action=self.action,
+            request_dict=request_dict,
+            policy_name=policy_name,
+        )
+        result = self.service.execute_transfer(transfer)
+        self.assertEqual(result["status"], AuthStatus.REJECT_POLICY_MISMATCH.value)
+        self.assertEqual(self.service.db.balance("vault-1"), 10000)
+
     def test_keyring_public_register_can_retire_and_purge_api(self):
         """4. Tests public key registration, can-retire query, and receipt purging APIs."""
         k_id = secrets.token_bytes(16)
@@ -201,7 +240,22 @@ class TestAPIServiceFullCoverageIntegration(unittest.TestCase):
 class TestFastAPIRoutesAndMiddleware(unittest.TestCase):
     def setUp(self):
         service.__init__()
-        self.client = TestClient(app)
+        self.tokens = {
+            "client": "c" * 40,
+            "auditor": "u" * 40,
+            "admin": "a" * 40,
+        }
+        self.env_patcher = patch.dict(
+            os.environ,
+            {
+                "ZKAEDI_API_CLIENT_TOKEN": self.tokens["client"],
+                "ZKAEDI_API_AUDITOR_TOKEN": self.tokens["auditor"],
+                "ZKAEDI_API_ADMIN_TOKEN": self.tokens["admin"],
+            },
+        )
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+        self.client = TestClient(app, headers={"Authorization": _authorization_header(self.tokens["admin"])})
 
     def test_health_endpoint(self):
         resp = self.client.get("/health")
@@ -302,15 +356,16 @@ class TestFastAPIRoutesAndMiddleware(unittest.TestCase):
 
         # Policy & Account
         resp = self.client.post("/api/v1/policy/set", json={
-            "policy_name": "api_policy", "canonical_policy_dict": {"allow": True}
+            "policy_name": "api_policy",
+            "canonical_policy_dict": {"allow_transfer": True, "max_amount_minor": 1000},
         })
         self.assertEqual(resp.status_code, 200)
 
-        # Set empty policy -> 400
+        # Unsupported policy fields are rejected.
         resp = self.client.post("/api/v1/policy/set", json={
-            "policy_name": "bad_pol", "canonical_policy_dict": {}
+            "policy_name": "bad_pol", "canonical_policy_dict": {"unrecognized_rule": True}
         })
-        # If policy dict is empty, it encodes to b'{}', which is non-empty bytes. Let's test non-serializable policy:
+        self.assertEqual(resp.status_code, 400)
         with patch.object(service.db, "set_policy", side_effect=ValueError("policy error")):
             resp_err = self.client.post("/api/v1/policy/set", json={
                 "policy_name": "err_pol", "canonical_policy_dict": {"k": 1}
@@ -492,17 +547,11 @@ class TestFastAPIRoutesAndMiddleware(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_threshold_endpoints(self):
-        # 1. DKG
+        # These prototype routes stay unavailable until cryptographic implementations are real.
         dkg_resp = self.client.post("/api/v1/threshold/dkg", json={"t": 3, "n": 5})
-        self.assertEqual(dkg_resp.status_code, 200)
-        dkg_data = dkg_resp.json()
-        self.assertEqual(dkg_data["t"], 3)
-        self.assertEqual(dkg_data["n"], 5)
-        self.assertIn("group_public_key_hex", dkg_data)
-
-        # DKG error path
+        self.assertEqual(dkg_resp.status_code, 501)
         dkg_err = self.client.post("/api/v1/threshold/dkg", json={"t": 10, "n": 2})
-        self.assertEqual(dkg_err.status_code, 400)
+        self.assertEqual(dkg_err.status_code, 501)
 
         # 2. Batch Verify
         batch_payload = {
@@ -516,14 +565,11 @@ class TestFastAPIRoutesAndMiddleware(unittest.TestCase):
             ]
         }
         batch_resp = self.client.post("/api/v1/threshold/verify-batch", json=batch_payload)
-        self.assertEqual(batch_resp.status_code, 200)
-        batch_data = batch_resp.json()
-        self.assertTrue(batch_data["all_valid"])
-        self.assertEqual(batch_data["count"], 1)
+        self.assertEqual(batch_resp.status_code, 501)
 
         # Batch Verify error path
         batch_err = self.client.post("/api/v1/threshold/verify-batch", json={"tokens": [{"token_id": "t", "message_hex": "not_hex", "sig_hex": "00", "pk_hex": "00"}]})
-        self.assertEqual(batch_err.status_code, 400)
+        self.assertEqual(batch_err.status_code, 501)
 
         # 3. Epoch Advance
         advance_payload = {
@@ -533,10 +579,7 @@ class TestFastAPIRoutesAndMiddleware(unittest.TestCase):
             "state_root_hex": "aa" * 32,
         }
         adv_resp = self.client.post("/api/v1/threshold/epoch/advance", json=advance_payload)
-        self.assertEqual(adv_resp.status_code, 200)
-        adv_data = adv_resp.json()
-        self.assertEqual(adv_data["epoch"], 1)
-        self.assertEqual(adv_data["issuer"], "https://auth.net")
+        self.assertEqual(adv_resp.status_code, 501)
 
         # Epoch Advance error path (jump +2)
         adv_err_payload = {
@@ -546,4 +589,29 @@ class TestFastAPIRoutesAndMiddleware(unittest.TestCase):
             "state_root_hex": "bb" * 32,
         }
         adv_err = self.client.post("/api/v1/threshold/epoch/advance", json=adv_err_payload)
-        self.assertEqual(adv_err.status_code, 400)
+        self.assertEqual(adv_err.status_code, 501)
+
+    def test_role_authentication_is_fail_closed(self):
+        issue_payload = {
+            "issuer": "https://auth.net",
+            "principal_id": "usr_100",
+            "audience": "https://api.net",
+            "resource": "vault",
+            "action": "transfer",
+            "request_dict": {"action": "transfer"},
+        }
+        self.assertEqual(self.client.post("/api/v1/principal/init", json={
+            "principal_id": "forbidden", "generation": 1, "identity": 1,
+            "role": 1, "device": 1, "session": 1,
+        }, headers={"Authorization": _authorization_header(self.tokens["client"])}).status_code, 403)
+        self.assertEqual(self.client.post(
+            "/api/v1/auth/issue", json=issue_payload, headers={}
+        ).status_code, 401)
+        self.assertEqual(self.client.get(
+            "/api/v1/audit/verify",
+            headers={"Authorization": _authorization_header(self.tokens["client"])},
+        ).status_code, 403)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.client.post(
+                "/api/v1/auth/issue", json=issue_payload, headers={}
+            ).status_code, 503)

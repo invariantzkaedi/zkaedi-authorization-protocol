@@ -92,7 +92,7 @@ class TestTGM5Vector1NominalAndCrypto(unittest.TestCase):
         self.db.initialize_principal(self.principal_id, pack_state(1, 1, 1, 1, 1))
         self.db.initialize_issuer(self.issuer, 0)
         self.policy_name = "transfer_policy"
-        self.policy_dict = {"max_limit": 100000}
+        self.policy_dict = {"max_amount_minor": 100000}
         self.policy_digest = self.db.set_policy(self.policy_name, canonical_json_object(self.policy_dict))
 
         self.db.create_account("acct_src", 10000)
@@ -336,7 +336,7 @@ class TestTGM5Vector3FaultsAndSecurityRejections(unittest.TestCase):
         self.db.initialize_principal(self.principal_id, self.packed_state)
         self.db.initialize_issuer(self.issuer, 0)
         self.policy_name = "policy_faults"
-        self.policy_digest = self.db.set_policy(self.policy_name, b'{"rule": 1}')
+        self.policy_digest = self.db.set_policy(self.policy_name, b'{"allow_transfer": true}')
 
         self.db.create_account("acc1", 1000)
         self.db.create_account("acc2", 1000)
@@ -599,7 +599,7 @@ class TestTGM5Vector4DegradedLedgerAndDatabase(unittest.TestCase):
         self.db.initialize_principal(self.principal_id, self.packed_state)
         self.db.initialize_issuer(self.issuer, 0)
         self.policy_name = "policy_degraded"
-        self.policy_digest = self.db.set_policy(self.policy_name, b'{"allow": true}')
+        self.policy_digest = self.db.set_policy(self.policy_name, b'{"allow_transfer": true}')
 
         self.db.create_account("acct_a", 500)
         self.db.create_account("acct_b", 500)
@@ -814,7 +814,7 @@ class TestTGM5Vector4DegradedLedgerAndDatabase(unittest.TestCase):
         conn.commit()
         conn.close()
 
-        self.db.set_policy(self.policy_name, b'{"allow": false}')
+        self.db.set_policy(self.policy_name, b'{"allow_transfer": false}')
         with self.assertRaises(AuthorizationRejected) as cm:
             self.engine.execute_transfer(
                 tok_val, current_time=self.current_time, expected_issuer=self.issuer,
@@ -823,7 +823,7 @@ class TestTGM5Vector4DegradedLedgerAndDatabase(unittest.TestCase):
                 expected_policy_name=self.policy_name,
             )
         self.assertEqual(cm.exception.status, AuthStatus.REJECT_POLICY_MISMATCH)
-        self.db.set_policy(self.policy_name, b'{"allow": true}')
+        self.db.set_policy(self.policy_name, b'{"allow_transfer": true}')
 
         # Unknown principal / issuer / policy in live DB
         tok_unknown_p = self.codec.issue(
@@ -879,7 +879,7 @@ class TestTGM5Vector4DegradedLedgerAndDatabase(unittest.TestCase):
 
         # Replay failure branches (conflict, legacy unverified, tampered)
         self.db.initialize_principal("usr_rep", self.packed_state)
-        self.db.set_policy(self.policy_name, b'{"allow": true}')
+        self.db.set_policy(self.policy_name, b'{"allow_transfer": true}')
         cred_id_rep = secrets.token_bytes(16)
         tok_rep = self.codec.issue(
             key_id=self.cred_k_id, issuer=self.issuer, principal_id="usr_rep",
@@ -1357,7 +1357,7 @@ class TestKeyRingAndCodecComprehensiveBranches(unittest.TestCase):
         conn.close()
         migrated_db1 = AuthorizationDatabase(legacy_db_path1)
         c1 = migrated_db1.connect()
-        self.assertEqual(c1.execute("PRAGMA user_version").fetchone()[0], 26)
+        self.assertEqual(c1.execute("PRAGMA user_version").fetchone()[0], 27)
         c1.close()
 
         # 3. Legacy DB with neither receipt_signature nor receipt_key_id
@@ -1381,7 +1381,7 @@ class TestKeyRingAndCodecComprehensiveBranches(unittest.TestCase):
         conn.close()
         migrated_db2 = AuthorizationDatabase(legacy_db_path2)
         c2 = migrated_db2.connect()
-        self.assertEqual(c2.execute("PRAGMA user_version").fetchone()[0], 26)
+        self.assertEqual(c2.execute("PRAGMA user_version").fetchone()[0], 27)
         c2.close()
 
         # 4. Legacy DB with both receipt_signature and receipt_key_id
@@ -1405,7 +1405,7 @@ class TestKeyRingAndCodecComprehensiveBranches(unittest.TestCase):
         conn.close()
         migrated_db3 = AuthorizationDatabase(legacy_db_path3)
         c3 = migrated_db3.connect()
-        self.assertEqual(c3.execute("PRAGMA user_version").fetchone()[0], 26)
+        self.assertEqual(c3.execute("PRAGMA user_version").fetchone()[0], 27)
         c3.close()
 
     def test_database_rollback_on_error(self):
@@ -1421,7 +1421,7 @@ class TestKeyRingAndCodecComprehensiveBranches(unittest.TestCase):
 
         with patch.object(self.db, "connect", return_value=MockConn()):
             with self.assertRaises(sqlite3.OperationalError):
-                self.db.set_policy("rollback_pol", b'{"a": 1}')
+                self.db.set_policy("rollback_pol", b'{"allow_transfer": true}')
             with self.assertRaises(sqlite3.OperationalError):
                 self.db.purge_expired_receipts(1700000000)
 

@@ -48,7 +48,7 @@ A zero-trust, fail-closed authorization, credential issuance, and linearizable l
 ## 🔥 Key Security Invariants
 
 1. **Ed25519 Context-Bound Credentials:**
-   Fixed 249-byte binary tokens signed with Ed25519 containing 64-bit packed epoch state, validity time windows, issuer digests, principal digests, and request HMACs.
+   Fixed 329-byte binary tokens signed with Ed25519 containing packed principal state, issuer epochs, validity windows, issuer/principal/context digests, and a canonical request digest.
 2. **Linearizable Ledger & Replay Idempotency:**
    Executes transfers inside SQLite transactions and generates **Ed25519 commit receipts**. Replaying a token returns `IDEMPOTENT_REPLAY` with the verified receipt without double-executing.
 3. **Persistent Key Registry & Native SQLite Triggers:**
@@ -56,55 +56,41 @@ A zero-trust, fail-closed authorization, credential issuance, and linearizable l
    - `key_records_delete_guard`: Native trigger blocking `DELETE FROM key_records`.
 4. **Cross-Process Key Synchronization:**
    Signers and verifiers re-sync status with SQLite on every operation, immediately zeroizing in-memory private key material when rotated by a concurrent process.
-5. **Append-Only Audit Hash Chain:**
-   SHA-256 HMAC hash chain that detects head, middle, or tail deletions against trusted checkpoints.
+5. **HMAC Audit Hash Chain:**
+   SHA-256 HMAC chain detects modified events and deletions relative to a separately trusted checkpoint.
 
 ---
 
-## 📦 249-Byte Token Wire Format Specification
+## 📦 v26 Token Wire Format
 
 Tokens are compact, fixed-size binary structures encoded without variable-length delimiters to prevent parser-differential attacks:
 
 | Field Name | Offset | Size (Bytes) | Description |
 | :--- | :--- | :--- | :--- |
-| **Magic Byte** | `0` | `1` | Fixed protocol version identifier (`0x40` for v26.0) |
-| **Key ID** | `1` | `16` | Key identifier of the signing key pair |
-| **Packed State** | `17` | `8` | 64-bit packed bitfield: `generation:16`, `identity:12`, `role:12`, `device:12`, `session:12` |
-| **Issuer Epoch** | `25` | `8` | Big-endian uint64 global issuer epoch counter |
-| **Not Before** | `33` | `8` | Unix epoch timestamp (seconds) before which the token is invalid |
-| **Expires At** | `41` | `8` | Unix epoch timestamp (seconds) after which the token is expired |
-| **Issuer Digest** | `49` | `32` | SHA-256 hash of the normalized issuer URI |
-| **Principal Digest** | `81` | `32` | BLAKE2b keyed digest over `(principal_id, packed_state)` |
-| **Context Digest** | `113` | `32` | SHA-256 hash over canonical `(resource, action, audience, request_payload)` |
-| **Policy Digest** | `145` | `32` | SHA-256 hash of the canonical JSON policy rules |
-| **Ed25519 Signature** | `177` | `64` | Cryptographic signature over payload bytes `0..176` |
-| **Envelope Total** | — | **`241 bytes`** | *(Encapsulated in 249-byte structured wire frame)* |
+| **Protocol Version** | `0` | `1` | Fixed identifier (`0x40`) |
+| **Key ID** | `1` | `16` | Credential-signing key identifier |
+| **Issuer Epoch** | `17` | `8` | Big-endian uint64 issuer epoch |
+| **Packed Principal State** | `25` | `8` | `generation:16`, then identity/role/device/session:12 bits each |
+| **Issued At** | `33` | `8` | Unix timestamp in seconds |
+| **Not Before** | `41` | `8` | Earliest valid Unix timestamp |
+| **Expires At** | `49` | `8` | Exclusive expiry timestamp; maximum lifetime is 900 seconds |
+| **Credential ID** | `57` | `16` | Idempotency identifier |
+| **Issuer Digest** | `73` | `32` | SHA-256 over the normalized issuer |
+| **Principal Digest** | `105` | `32` | HMAC-SHA-256 over the normalized principal |
+| **Audience Digest** | `137` | `32` | SHA-256 over the normalized audience |
+| **Scope Digest** | `169` | `32` | SHA-256 over resource, action, and deployment ID |
+| **Request Digest** | `201` | `32` | SHA-256 over canonical, strict JSON request bytes |
+| **Policy Digest** | `233` | `32` | SHA-256 over canonical policy JSON |
+| **Ed25519 Signature** | `265` | `64` | Signature over payload bytes `0..264` |
+| **Total token size** | — | **`329 bytes`** | Payload plus signature; no extra frame |
 
 ---
 
-## 🛡️ Complete Rejection & Authorization Status Matrix
+## 🛡️ Authorization Statuses
 
-The protocol returns strict, disambiguated `AuthStatus` enum integers on all verification paths:
+The engine returns string-valued `AuthStatus` names; these are not numeric status codes:
 
-| Enum Code | Name | Description |
-| :--- | :--- | :--- |
-| `0` | `COMMIT_SUCCESS` | Token verified, policy passed, and transfer committed to ledger |
-| `1` | `IDEMPOTENT_REPLAY` | Identical valid token previously executed; returning original signed receipt |
-| `2` | `REJECT_EXPIRED` | Token timestamp is strictly greater than `expires_at` |
-| `3` | `REJECT_NOT_YET_VALID` | Token timestamp is strictly less than `not_before` |
-| `4` | `REJECT_INVALID_SIGNATURE`| Ed25519 cryptographic signature check failed |
-| `5` | `REJECT_STATE_MISMATCH` | Principal live epoch bitfield does not match token `packed_state` |
-| `6` | `REJECT_ISSUER_EPOCH_MISMATCH`| Global issuer epoch counter does not match token `issuer_epoch` |
-| `7` | `REJECT_POLICY_MISMATCH` | Live active policy SHA-256 digest differs from token `policy_digest` |
-| `8` | `REJECT_UNKNOWN_PRINCIPAL`| Principal ID not found in live database registry |
-| `9` | `REJECT_UNKNOWN_ISSUER` | Issuer URI digest not found in live database registry |
-| `10` | `REJECT_UNKNOWN_POLICY` | Policy name not registered in live database |
-| `11` | `REJECT_CREDENTIAL_CONFLICT`| Credential ID exists in ledger with conflicting token/principal payload |
-| `12` | `REJECT_RESULT_TAMPERED` | Persisted receipt payload hash mismatch detected |
-| `13` | `REJECT_INVALID_REQUEST` | Malformed request parameters or negative minor amount |
-| `14` | `REJECT_INSUFFICIENT_FUNDS`| Source account balance is less than transfer amount |
-| `15` | `REJECT_KEY_NOT_ACTIVE` | Signing key is not in `ACTIVE` state for new issuances |
-| `16` | `REJECT_LEGACY_RESULT_UNVERIFIED`| Missing receipt signature in legacy unmigrated record |
+The exact values are defined by `AuthStatus` in `src/context_bound_epoch_protocol.py`. They distinguish successful commits and replays from malformed credentials, signature/key/time/context/state/policy rejections, ledger failures, and tampered or unverifiable prior results. The HTTP layer returns these names in JSON response data; it does not assign the numeric codes shown in older versions of this document.
 
 ---
 
@@ -129,7 +115,8 @@ CREATE TABLE IF NOT EXISTS issuers (
 -- Canonical Policies
 CREATE TABLE IF NOT EXISTS policies (
     policy_name TEXT PRIMARY KEY,
-    policy_digest BLOB NOT NULL
+policy_digest BLOB NOT NULL,
+canonical_policy BLOB NOT NULL
 ) STRICT;
 
 -- Financial Ledger Accounts
@@ -152,26 +139,36 @@ CREATE TABLE IF NOT EXISTS key_records (
 -- Idempotent Credential Execution Receipts
 CREATE TABLE IF NOT EXISTS credential_results (
     credential_id BLOB PRIMARY KEY,
-    status INTEGER NOT NULL,
-    token_digest BLOB NOT NULL,
+token_digest BLOB NOT NULL,
+request_digest BLOB NOT NULL,
     principal_digest BLOB NOT NULL,
     result_digest BLOB NOT NULL,
     result_payload BLOB NOT NULL,
     receipt_signature BLOB NOT NULL,
     receipt_key_id BLOB NOT NULL,
-    created_at INTEGER NOT NULL
+committed_at INTEGER NOT NULL,
+expires_at INTEGER NOT NULL
 ) STRICT;
 
 -- Cryptographic Audit HMAC Chain
 CREATE TABLE IF NOT EXISTS audit_events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_type TEXT NOT NULL,
-    event_hash BLOB NOT NULL,
     previous_hash BLOB NOT NULL,
-    timestamp INTEGER NOT NULL,
+    event_hash BLOB NOT NULL,
     payload BLOB NOT NULL
 ) STRICT;
 ```
+
+Database schema migrations advance the SQLite `user_version` to 27. Existing policies created before schema 27 have no stored canonical rule body and fail closed at transfer time until each is set again through `/api/v1/policy/set`.
+
+### Transfer policy format
+
+Policies are canonical JSON objects supporting only:
+
+- `allow_transfer`: optional boolean; defaults to `true`.
+- `max_amount_minor`: optional positive integer upper bound per transfer.
+
+Unknown fields and invalid types are rejected when setting a policy. The policy body is persisted along with its digest and evaluated against each transfer after the live digest check.
 
 ---
 
@@ -323,7 +320,21 @@ python tests/benchmark_concurrency_latency.py
 uvicorn src.api_service:app --reload --port 8000
 ```
 
-Inspect interactive OpenAPI documentation at `http://127.0.0.1:8000/docs`.
+Configure distinct bearer secrets of at least 32 UTF-8 bytes before use:
+
+```bash
+export ZKAEDI_API_CLIENT_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+export ZKAEDI_API_AUDITOR_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+export ZKAEDI_API_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+```
+
+Send the configured token in the `Authorization` header using the `Bearer` authentication scheme. Client credentials authorize issuance, transfer, and balance reads; auditor credentials authorize audit verification; admin credentials authorize all `/api/v1` operations. Missing/weak server configuration fails closed (503); missing credentials return 401 and insufficient roles return 403. `/health` is public. HSTS is only a response header: terminate TLS at a correctly configured trusted proxy or serve TLS directly, and do not expose this local development configuration publicly. The service currently generates signing/binding/audit keys at startup; stable production key custody and restoration are not implemented, so the service is not production-ready.
+
+The threshold DKG, threshold epoch, and previously experimental batch-verification REST operations return HTTP 501 until their threshold protocols have independent, real cryptographic implementations. `src/lockfree_memory_vault.py` is a state prefilter only; it never authorizes a token because it does not verify the Ed25519 signature.
+
+For production deployment, additionally define a managed secret/key provider and rotation/recovery process, TLS and proxy policy, encrypted backups and tested restore, schema migration roll-forward/rollback procedures, monitoring/alerting, and incident response. The bundled service does not implement these deployment controls.
+
+Inspect interactive OpenAPI documentation at `http://127.0.0.1:8000/docs` only in a trusted development environment.
 
 ---
 
@@ -346,6 +357,9 @@ Inspect interactive OpenAPI documentation at `http://127.0.0.1:8000/docs`.
 | | `GET` | `/api/v1/keyring/{key_id_hex}/can-retire` | Query atomic `can_retire_key()` receipt status |
 | | `POST` | `/api/v1/receipts/purge-expired` | Purge expired receipt records |
 | **Audit Log** | `GET` | `/api/v1/audit/verify` | Verify HMAC audit hash chain against trusted checkpoints |
+| **Threshold crypto** | `POST` | `/api/v1/threshold/dkg` | Disabled (HTTP 501; prototype cryptography is not trusted) |
+| | `POST` | `/api/v1/threshold/verify-batch` | Disabled (HTTP 501; use the standalone real Ed25519 verifier only where appropriate) |
+| | `POST` | `/api/v1/threshold/epoch/advance` | Disabled (HTTP 501; no validated threshold signer is available) |
 
 ---
 

@@ -73,7 +73,7 @@ class TestLockFreeMemoryVault(unittest.TestCase):
         self.assertTrue(self.vault.validate_epoch_fast(slot, new_val))
         self.assertEqual(self.vault.invalidate_epoch_atomic(-1, 12), 0)
 
-    def test_05_fast_validator_success(self):
+    def test_05_fast_validator_never_authorizes_without_signature_verification(self):
         state = pack_state(10, 1, 1, 1, 1)
         slot = self.vault.register_principal("user_fast", state)
         req_bytes = canonical_json_object({"action": "read"})
@@ -94,8 +94,8 @@ class TestLockFreeMemoryVault(unittest.TestCase):
         )
 
         ok, status = self.validator.fast_unpack_and_validate(token, self.now, slot)
-        self.assertTrue(ok)
-        self.assertEqual(status, "COMMIT_SUCCESS")
+        self.assertFalse(ok)
+        self.assertEqual(status, "REJECT_CRYPTOGRAPHIC_VERIFICATION_REQUIRED")
 
     def test_06_fast_validator_rejections(self):
         state = pack_state(10, 1, 1, 1, 1)

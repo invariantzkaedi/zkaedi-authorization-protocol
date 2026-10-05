@@ -1023,6 +1023,32 @@ class AuthorizationDatabase:
                     END;
                 """)
 
+                policy_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='policies'"
+                ).fetchone()
+                if policy_sql and "STRICT" not in policy_sql[0]:
+                    policy_columns = {
+                        row[1] for row in connection.execute("PRAGMA table_info(policies)")
+                    }
+                    canonical_column = (
+                        "canonical_policy"
+                        if "canonical_policy" in policy_columns
+                        else "NULL"
+                    )
+                    connection.execute("""
+                        CREATE TABLE policies_v27 (
+                            policy_name TEXT PRIMARY KEY,
+                            policy_digest BLOB NOT NULL CHECK(length(policy_digest) = 32),
+                            canonical_policy BLOB CHECK(canonical_policy IS NULL OR length(canonical_policy) > 0)
+                        ) STRICT;
+                    """)
+                    connection.execute(
+                        f"INSERT INTO policies_v27(policy_name, policy_digest, canonical_policy) "
+                        f"SELECT policy_name, policy_digest, {canonical_column} FROM policies"
+                    )
+                    connection.execute("DROP TABLE policies;")
+                    connection.execute("ALTER TABLE policies_v27 RENAME TO policies;")
+
                 # 3. CREDENTIAL RESULTS REPLAY HISTORY PRESERVATION
                 res_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='credential_results'").fetchone()
                 cols = [c[1] for c in connection.execute("PRAGMA table_info(credential_results)").fetchall()]

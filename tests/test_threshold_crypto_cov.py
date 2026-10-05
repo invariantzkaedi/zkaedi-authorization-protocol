@@ -7,6 +7,8 @@ Covers every branch, edge condition, exception path, and mathematical helper in 
 import pytest
 import sqlite3
 from typing import Set
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from src.crypto.dkg import (
     _random_scalar, _scalar_to_bytes, _bytes_to_scalar, _scalar_mul_base,
@@ -191,9 +193,18 @@ def test_batch_verifier_edge_cases():
     assert valid and lat == 0.0 and bad == []
 
     # Valid tokens
-    toks = [CredentialToken("t1", b"m1", b"\x01" * 64, b"\x02" * 32)]
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    signature = private_key.sign(b"m1")
+    toks = [CredentialToken("t1", b"m1", signature, public_key)]
     valid, lat, bad = verify_token_batch_simd(toks)
     assert valid and bad == []
+
+    toks_invalid = [CredentialToken("t1", b"m1", b"\x01" * 64, public_key)]
+    valid, _, bad = verify_token_batch_simd(toks_invalid)
+    assert not valid and bad == [0]
 
     # Corrupt signature length
     toks_bad_sig = [CredentialToken("t1", b"m1", b"\x01" * 32, b"\x02" * 32)]
@@ -255,13 +266,9 @@ def test_epoch_manager_all_paths():
     with pytest.raises(ValueError):
         mgr.request_advance(req_bad, parts)
 
-    # Valid advance (+1)
+    # Threshold signing is disabled until backed by real group operations.
     req_good = EpochAdvanceRequest("iss_1", 0, 1, b"\xaa" * 32)
-    cert = mgr.request_advance(req_good, parts)
-    assert cert.epoch == 1
-    assert cert.message() == b"EPOCH_ADVANCE" + b"iss_1" + (1).to_bytes(8, "big") + b"\xaa" * 32
-    assert mgr.verify_certificate(cert)
-
-    # Verify certificate edge case
+    with pytest.raises(NotImplementedError):
+        mgr.request_advance(req_good, parts)
     cert_bad_sig = EpochCertificate("iss_1", 1, b"\xaa" * 32, FROSTSignature(b"\x00" * 16, b"\x00" * 16), {1}, 0)
     assert not mgr.verify_certificate(cert_bad_sig)

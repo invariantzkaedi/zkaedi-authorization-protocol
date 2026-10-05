@@ -180,7 +180,7 @@ def benchmark_sqlite_concurrency(worker_counts: List[int] = [1, 2, 4, 8, 16], to
         engine = LinearizableEngine(db, codec, audit_key, receipt_keyring, receipt_k_id)
 
         policy_name = "default_policy"
-        policy_digest = db.set_policy(policy_name, b'{"allow": true}')
+        policy_digest = db.set_policy(policy_name, b'{"allow_transfer": true}')
 
         # Setup accounts and principals
         db.create_account("acct_source", 100_000_000)
@@ -506,4 +506,3 @@ if __name__ == "__main__":
     benchmark_end_to_end_service(trials=500)
     benchmark_lockfree_memory_vault(total_operations=1_000_000, num_workers=16)
     benchmark_50k_concurrent_streams(streams_count=50_000)
-
