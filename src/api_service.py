@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 import os
 import secrets
 import sys
@@ -25,10 +26,6 @@ from src.context_bound_epoch_protocol import (
     _field_digest,
     pack_state,
 )
-from src.crypto.dkg import run_dkg
-from src.crypto.batch_verifier import CredentialToken, verify_token_batch_simd
-from src.crypto.frost_signer import FROSTParticipant
-from src.epoch_manager import EpochManager, EpochAdvanceRequest
 
 # Optional FastAPI / Pydantic imports for OpenAPI docs
 try:  # pragma: no cover
@@ -203,6 +200,22 @@ class AuthorizationServiceApp:
         self.db.create_account("vault-1", 10000)
         self.db.create_account("vault-2", 5000)
 
+    def _record_audit(self, event_type: str, payload: Dict[str, Any]) -> None:
+        connection = self.db.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self.db.append_audit_log(
+                connection,
+                self.audit_key,
+                {"event_type": event_type, **payload, "timestamp": int(time.time())},
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     # 1. TOKEN & TRANSFER APIS
     def issue_token(self, req: IssueTokenRequest) -> Dict[str, Any]:
         snap = self.db.issuance_snapshot(req.principal_id, req.issuer, req.policy_name)
@@ -225,6 +238,12 @@ class AuthorizationServiceApp:
             action=req.action,
             request_bytes=req_bytes,
             policy_digest=snap.policy_digest,
+        )
+        self._record_audit(
+            "credential_issued",
+            {"issuer_digest": _field_digest(b"issuer-v1", req.issuer).hex(),
+             "principal_digest": self.codec._principal_digest(req.principal_id).hex(),
+             "policy_name": req.policy_name},
         )
 
         return {
@@ -266,28 +285,49 @@ class AuthorizationServiceApp:
     def init_principal(self, req: InitPrincipalRequest) -> Dict[str, Any]:
         state = pack_state(req.generation, req.identity, req.role, req.device, req.session)
         self.db.initialize_principal(req.principal_id, state)
+        self._record_audit("principal_initialized", {"principal_id": req.principal_id})
         return {"status": "INITIALIZED", "principal_id": req.principal_id, "packed_state": state}
 
     def bump_principal_epoch(self, req: BumpPrincipalEpochRequest) -> Dict[str, Any]:
         new_state = self.db.bump_principal_epoch(req.principal_id, req.field)
+        self._record_audit(
+            "principal_epoch_bumped",
+            {"principal_id": req.principal_id, "field": req.field, "new_state": new_state},
+        )
         return {"status": "BUMPED", "principal_id": req.principal_id, "field": req.field, "new_state": new_state}
 
     def init_issuer(self, req: InitIssuerRequest) -> Dict[str, Any]:
         self.db.initialize_issuer(req.issuer, req.epoch)
+        self._record_audit(
+            "issuer_initialized",
+            {"issuer_digest": _field_digest(b"issuer-v1", req.issuer).hex(), "epoch": req.epoch},
+        )
         return {"status": "INITIALIZED", "issuer": req.issuer, "epoch": req.epoch}
 
     def bump_issuer_epoch(self, issuer: str) -> Dict[str, Any]:
         new_epoch = self.db.bump_issuer_epoch(issuer)
+        self._record_audit(
+            "issuer_epoch_bumped",
+            {"issuer_digest": _field_digest(b"issuer-v1", issuer).hex(), "new_epoch": new_epoch},
+        )
         return {"status": "BUMPED", "issuer": issuer, "new_epoch": new_epoch}
 
     # 3. POLICY & ACCOUNT APIS
     def set_policy(self, req: SetPolicyRequest) -> Dict[str, Any]:
         policy_bytes = canonical_json_object(req.canonical_policy_dict)
         digest = self.db.set_policy(req.policy_name, policy_bytes)
+        self._record_audit(
+            "policy_set",
+            {"policy_name": req.policy_name, "policy_digest": digest.hex()},
+        )
         return {"status": "SET", "policy_name": req.policy_name, "policy_digest": digest.hex()}
 
     def create_account(self, req: CreateAccountRequest) -> Dict[str, Any]:
         self.db.create_account(req.account_id, req.balance_minor)
+        self._record_audit(
+            "account_created",
+            {"account_id": req.account_id, "balance_minor": req.balance_minor},
+        )
         return {"status": "CREATED", "account_id": req.account_id, "balance_minor": req.balance_minor}
 
     def get_account_balance(self, account_id: str) -> Dict[str, Any]:
@@ -301,6 +341,10 @@ class AuthorizationServiceApp:
         new_st = KeyStatus(req.new_status)
 
         target_ring.transition(target_key_id, new_st)
+        self._record_audit(
+            "key_status_changed",
+            {"key_id": target_key_id.hex(), "keyring": req.keyring_type, "new_status": new_st.value},
+        )
         return {
             "status": "TRANSITIONED",
             "keyring": req.keyring_type,
@@ -311,6 +355,10 @@ class AuthorizationServiceApp:
         k_id = bytes.fromhex(req.key_id_hex)
         pub_bytes = bytes.fromhex(req.public_key_hex)
         self.cred_keyring.register_public(k_id, pub_bytes, req.issuer, status=KeyStatus(req.status))
+        self._record_audit(
+            "public_key_registered",
+            {"key_id": k_id.hex(), "issuer_digest": _field_digest(b"issuer-v1", req.issuer).hex()},
+        )
         return {"status": "REGISTERED", "key_id_hex": req.key_id_hex}
 
     def can_retire_key(self, key_id_hex: str) -> Dict[str, Any]:
@@ -343,54 +391,13 @@ class AuthorizationServiceApp:
 
     # THRESHOLD CRYPTO SERVICE METHODS
     def initiate_dkg(self, req: DKGInitiateRequest) -> Dict[str, Any]:
-        tr = run_dkg(req.t, req.n)
-        return {
-            "t": tr.t,
-            "n": tr.n,
-            "qual_nodes": sorted(list(tr.qual)),
-            "group_public_key_hex": tr.group_public_key.hex() if tr.group_public_key else "",
-            "verification_shares_count": len(tr.verification_shares),
-        }
+        raise NotImplementedError("threshold cryptography is disabled until real cryptographic verification is implemented")
 
     def verify_batch(self, req: BatchVerifyRequest) -> Dict[str, Any]:
-        tokens = []
-        for item in req.tokens:
-            tok = CredentialToken(
-                token_id=item.get("token_id", "tok"),
-                message=bytes.fromhex(item.get("message_hex", "")),
-                signature=bytes.fromhex(item.get("sig_hex", "")),
-                public_key=bytes.fromhex(item.get("pk_hex", "")),
-            )
-            tokens.append(tok)
-        all_valid, amortized_us, invalid_indices = verify_token_batch_simd(tokens)
-        return {
-            "all_valid": all_valid,
-            "count": len(tokens),
-            "amortized_latency_us": round(amortized_us, 4),
-            "invalid_indices": invalid_indices,
-        }
+        raise NotImplementedError("batch verification is disabled until each signature is cryptographically verified")
 
     def advance_threshold_epoch(self, req: ThresholdEpochAdvanceRequest) -> Dict[str, Any]:
-        tr = run_dkg(3, 5)
-        mgr = EpochManager(tr, 3, db_path=str(self.db_path))
-        parts = [
-            FROSTParticipant(i, i * 100, tr.verification_shares.get(i, b"\x00"*32))
-            for i in range(1, 4)
-        ]
-        advance_req = EpochAdvanceRequest(
-            issuer_id=req.issuer,
-            current_epoch=req.current_epoch,
-            target_epoch=req.target_epoch,
-            state_root=bytes.fromhex(req.state_root_hex),
-        )
-        cert = mgr.request_advance(advance_req, parts)
-        return {
-            "issuer": cert.issuer_id,
-            "epoch": cert.epoch,
-            "signature_hex": cert.signature.to_bytes().hex(),
-            "signers": sorted(list(cert.signer_ids)),
-            "issued_at": cert.issued_at,
-        }
+        raise NotImplementedError("threshold epoch advancement is disabled until a real threshold signature scheme is implemented")
 
     def cleanup(self) -> None:
         if self._temp_dir:
@@ -410,8 +417,49 @@ if HAS_FASTAPI:
     @app.middleware("http")
     async def add_security_headers(request: Request, call_next):
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_BYTES:
-            return Response(content="Payload Too Large", status_code=status.HTTP_413_CONTENT_TOO_LARGE)
+        if content_length:
+            try:
+                content_length_value = int(content_length)
+            except ValueError:
+                return Response(content="Invalid Content-Length", status_code=status.HTTP_400_BAD_REQUEST)
+            if content_length_value < 0:
+                return Response(content="Invalid Content-Length", status_code=status.HTTP_400_BAD_REQUEST)
+            if content_length_value > MAX_REQUEST_BYTES:
+                return Response(content="Payload Too Large", status_code=status.HTTP_413_CONTENT_TOO_LARGE)
+
+        required_role = None
+        if request.url.path in ("/api/v1/auth/issue", "/api/v1/auth/transfer") or (
+            request.url.path.startswith("/api/v1/account/") and request.method == "GET"
+        ):
+            required_role = "client"
+        elif request.url.path == "/api/v1/audit/verify":
+            required_role = "auditor"
+        elif request.url.path.startswith("/api/v1/"):
+            required_role = "admin"
+
+        if required_role is not None:
+            configured_tokens = {
+                role: os.environ.get(f"ZKAEDI_API_{role.upper()}_TOKEN", "")
+                for role in ("client", "auditor", "admin")
+            }
+            configured_tokens = {
+                role: token for role, token in configured_tokens.items() if token
+            }
+            if not configured_tokens or any(len(token.encode("utf-8")) < 32 for token in configured_tokens.values()):
+                return Response(content="API authentication is not configured securely", status_code=503)
+            authorization = request.headers.get("authorization", "")
+            supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
+            matched_roles = {
+                role for role, token in configured_tokens.items()
+                if supplied and hmac.compare_digest(supplied, token)
+            }
+            allowed = "admin" in matched_roles or required_role in matched_roles
+            if not supplied:
+                return Response(content="Authorization required", status_code=401)
+            if not matched_roles:
+                return Response(content="Invalid bearer token", status_code=401)
+            if not allowed:
+                return Response(content="Insufficient API role", status_code=403)
 
         response: Response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -528,6 +576,8 @@ if HAS_FASTAPI:
     def api_initiate_dkg(req: DKGInitiateRequest):
         try:
             return service.initiate_dkg(req)
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
@@ -535,6 +585,8 @@ if HAS_FASTAPI:
     def api_verify_batch(req: BatchVerifyRequest):
         try:
             return service.verify_batch(req)
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
@@ -542,6 +594,8 @@ if HAS_FASTAPI:
     def api_advance_threshold_epoch(req: ThresholdEpochAdvanceRequest):
         try:
             return service.advance_threshold_epoch(req)
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 

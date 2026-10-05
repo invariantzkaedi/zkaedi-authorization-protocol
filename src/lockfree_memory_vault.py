@@ -89,7 +89,7 @@ class LockFreeAtomicEpochVault:
 
 class FastZeroAllocValidator:
     """
-    Zero-allocation high-throughput token validator and memory vault router.
+    Experimental header/state prefilter. It is not an authorization verifier.
     """
 
     def __init__(self, vault: LockFreeAtomicEpochVault):
@@ -140,4 +140,4 @@ class FastZeroAllocValidator:
         if not self.vault.validate_epoch_fast(slot, packed_state):
             return False, "REJECT_STATE_MISMATCH"
 
-        return True, "COMMIT_SUCCESS"
+        return False, "REJECT_CRYPTOGRAPHIC_VERIFICATION_REQUIRED"

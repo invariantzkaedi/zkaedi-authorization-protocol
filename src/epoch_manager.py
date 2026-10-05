@@ -79,38 +79,19 @@ class EpochManager:
         req: EpochAdvanceRequest,
         participants: List[FROSTParticipant],
     ) -> EpochCertificate:
-        if req.target_epoch != req.current_epoch + 1:
-            raise ValueError(f"Epoch must advance by exactly +1 (requested {req.target_epoch} from {req.current_epoch})")
-
-        msg = b"EPOCH_ADVANCE" + req.issuer_id.encode() + \
-              req.target_epoch.to_bytes(8, "big") + req.state_root
-
-        # Generate (t, n) FROST threshold signature
-        sig = frost_coordinate(
-            participants=participants,
-            message=msg,
-            group_public_key=self.group_pk,
-            t=self.t,
+        raise NotImplementedError(
+            "threshold epoch advancement is disabled: the bundled threshold signer is not cryptographically verified"
         )
-
-        cert = EpochCertificate(
-            issuer_id=req.issuer_id,
-            epoch=req.target_epoch,
-            state_root=req.state_root,
-            signature=sig,
-            signer_ids={p.id for p in participants[:self.t]},
-            issued_at=int(time.time()),
-        )
-
-        # Commit to SQLite STRICT Ledger
-        cur = self.db.cursor()
-        cur.execute(
-            "INSERT INTO threshold_epoch_proofs (issuer_id, epoch_number, state_root_hash, quorum_signature, created_at) VALUES (?, ?, ?, ?, ?)",
-            (cert.issuer_id, cert.epoch, cert.state_root, cert.signature.to_bytes(), cert.issued_at)
-        )
-        self.db.commit()
-        return cert
 
     def verify_certificate(self, cert: EpochCertificate) -> bool:
-        """Verifies quorum certificate format and 64-byte Ed25519 signature."""
-        return len(cert.signature.to_bytes()) == 64
+        """Verifies an Ed25519 certificate under the configured group public key."""
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        try:
+            Ed25519PublicKey.from_public_bytes(self.group_pk).verify(
+                cert.signature.to_bytes(), cert.message()
+            )
+        except (InvalidSignature, ValueError):
+            return False
+        return True

@@ -7,8 +7,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
 import hashlib
-import secrets
 import time
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 L = 2**252 + 27742317777372353535851937790883648493
 
@@ -31,21 +33,18 @@ def verify_token_batch_simd(tokens: List[CredentialToken]) -> Tuple[bool, float,
     k = len(tokens)
     invalid_indices = []
 
-    # Sample random 128-bit weights
-    alphas = [secrets.randbits(128) for _ in range(k)]
-
-    # Compute random linear combination
-    accum_s = 0
     for i, tok in enumerate(tokens):
         if len(tok.signature) != 64 or len(tok.public_key) != 32:
             invalid_indices.append(i)
             continue
-        s_val = int.from_bytes(tok.signature[32:], "little") % L
-        accum_s = (accum_s + alphas[i] * s_val) % L
+        try:
+            Ed25519PublicKey.from_public_bytes(tok.public_key).verify(tok.signature, tok.message)
+        except (InvalidSignature, ValueError):
+            invalid_indices.append(i)
 
     t1 = time.perf_counter_ns()
     elapsed_us = (t1 - t0) / 1000.0
     amortized_us = elapsed_us / k if k > 0 else 0.0
 
-    all_valid = (len(invalid_indices) == 0)
+    all_valid = not invalid_indices
     return all_valid, amortized_us, invalid_indices

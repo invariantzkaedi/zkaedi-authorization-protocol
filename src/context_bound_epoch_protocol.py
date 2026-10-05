@@ -342,6 +342,19 @@ def canonical_json_object(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def validate_transfer_policy(policy_bytes: bytes) -> dict[str, Any]:
+    policy = parse_strict_json(policy_bytes)
+    if not isinstance(policy, dict) or set(policy) - {"allow_transfer", "max_amount_minor"}:
+        raise ValueError("policy must contain only allow_transfer and max_amount_minor")
+    if "allow_transfer" in policy and not isinstance(policy["allow_transfer"], bool):
+        raise ValueError("allow_transfer must be a boolean")
+    if "max_amount_minor" in policy:
+        limit = policy["max_amount_minor"]
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ValueError("max_amount_minor must be a positive integer")
+    return policy
+
+
 def _length_prefixed(*parts: bytes) -> bytes:
     return b"".join(struct.pack(">I", len(part)) + part for part in parts)
 
@@ -829,7 +842,8 @@ CREATE TABLE IF NOT EXISTS issuers (
 
 CREATE TABLE IF NOT EXISTS policies (
     policy_name TEXT PRIMARY KEY,
-    policy_digest BLOB NOT NULL CHECK(length(policy_digest) = 32)
+    policy_digest BLOB NOT NULL CHECK(length(policy_digest) = 32),
+    canonical_policy BLOB NOT NULL CHECK(length(canonical_policy) > 0)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS accounts (
@@ -935,7 +949,7 @@ class AuthorizationDatabase:
     def _migrate_schema(self, connection: sqlite3.Connection) -> None:
         """MANDATORY MIGRATION: Preserves replay rows, validates legacy data integrity, updates all tables and triggers to v26 STRICT."""
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version < 26:
+        if version < 27:
             connection.execute("BEGIN EXCLUSIVE")
             try:
                 # 1. ACCOUNT INTEGRITY MIGRATION WITH STRICT ZERO-DATA-LOSS CHECK
@@ -1046,10 +1060,14 @@ class AuthorizationDatabase:
                 # 4. MIGRATE REMAINING TABLES TO STRICT
                 self._migrate_table_to_strict(connection, "principals", "CREATE TABLE principals (principal_id TEXT PRIMARY KEY, packed_state BLOB NOT NULL CHECK(length(packed_state) = 8)) STRICT;")
                 self._migrate_table_to_strict(connection, "issuers", "CREATE TABLE issuers (issuer_digest BLOB PRIMARY KEY CHECK(length(issuer_digest) = 32), issuer_epoch BLOB NOT NULL CHECK(length(issuer_epoch) = 8)) STRICT;")
-                self._migrate_table_to_strict(connection, "policies", "CREATE TABLE policies (policy_name TEXT PRIMARY KEY, policy_digest BLOB NOT NULL CHECK(length(policy_digest) = 32)) STRICT;")
+                self._migrate_table_to_strict(connection, "policies", "CREATE TABLE policies (policy_name TEXT PRIMARY KEY, policy_digest BLOB NOT NULL CHECK(length(policy_digest) = 32), canonical_policy BLOB CHECK(canonical_policy IS NULL OR length(canonical_policy) > 0)) STRICT;")
                 self._migrate_table_to_strict(connection, "audit_events", "CREATE TABLE audit_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, previous_hash BLOB NOT NULL CHECK(length(previous_hash) = 32), event_hash BLOB NOT NULL CHECK(length(event_hash) = 32), payload BLOB NOT NULL) STRICT;")
 
-                connection.execute("PRAGMA user_version = 26;")
+                policy_columns = {row[1] for row in connection.execute("PRAGMA table_info(policies)")}
+                if "canonical_policy" not in policy_columns:
+                    connection.execute("ALTER TABLE policies ADD COLUMN canonical_policy BLOB")
+
+                connection.execute("PRAGMA user_version = 27;")
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -1187,14 +1205,16 @@ class AuthorizationDatabase:
         name = normalize_context(policy_name, "policy_name")
         if not isinstance(canonical_policy, bytes) or not canonical_policy:
             raise ValueError("canonical_policy must be non-empty bytes")
-        digest = hashlib.sha256(canonical_policy).digest()
+        normalized_policy = canonical_json(canonical_policy)
+        validate_transfer_policy(normalized_policy)
+        digest = hashlib.sha256(normalized_policy).digest()
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                "INSERT INTO policies(policy_name, policy_digest) VALUES(?, ?) "
-                "ON CONFLICT(policy_name) DO UPDATE SET policy_digest = excluded.policy_digest",
-                (name, digest),
+                "INSERT INTO policies(policy_name, policy_digest, canonical_policy) VALUES(?, ?, ?) "
+                "ON CONFLICT(policy_name) DO UPDATE SET policy_digest = excluded.policy_digest, canonical_policy = excluded.canonical_policy",
+                (name, digest, normalized_policy),
             )
             connection.commit()
         except Exception:
@@ -1611,18 +1631,29 @@ class LinearizableEngine:
             live_issuer_epoch = _uint64_from_blob(issuer_row[0], "issuer_epoch")
 
             policy_row = connection.execute(
-                "SELECT policy_digest FROM policies WHERE policy_name = ?",
+                "SELECT policy_digest, canonical_policy FROM policies WHERE policy_name = ?",
                 (normalize_context(expected_policy_name, "expected_policy_name"),),
             ).fetchone()
             if policy_row is None:
                 raise AuthorizationRejected(AuthStatus.REJECT_UNKNOWN_POLICY)
-            live_policy_digest = policy_row[0]
+            live_policy_digest, live_policy_bytes = policy_row
 
             if (claims.packed_state ^ live_state) != 0:
                 raise AuthorizationRejected(AuthStatus.REJECT_STATE_MISMATCH)
             if claims.issuer_epoch != live_issuer_epoch:
                 raise AuthorizationRejected(AuthStatus.REJECT_ISSUER_EPOCH_MISMATCH)
             if not hmac.compare_digest(claims.policy_digest, live_policy_digest):
+                raise AuthorizationRejected(AuthStatus.REJECT_POLICY_MISMATCH)
+            if live_policy_bytes is None:
+                raise AuthorizationRejected(AuthStatus.REJECT_POLICY_MISMATCH)
+            try:
+                live_policy = validate_transfer_policy(live_policy_bytes)
+            except (TypeError, ValueError):
+                raise AuthorizationRejected(AuthStatus.REJECT_POLICY_MISMATCH)
+            if live_policy.get("allow_transfer", True) is not True:
+                raise AuthorizationRejected(AuthStatus.REJECT_POLICY_MISMATCH)
+            max_amount = live_policy.get("max_amount_minor")
+            if max_amount is not None and amount_minor > max_amount:
                 raise AuthorizationRejected(AuthStatus.REJECT_POLICY_MISMATCH)
 
             if crash_point == "after_authority_check":
