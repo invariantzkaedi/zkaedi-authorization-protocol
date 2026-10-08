@@ -870,6 +870,20 @@ CREATE TABLE IF NOT EXISTS audit_events (
     payload BLOB NOT NULL
 ) STRICT;
 
+CREATE TRIGGER IF NOT EXISTS audit_events_update_guard
+BEFORE UPDATE ON audit_events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_events_delete_guard
+BEFORE DELETE ON audit_events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only');
+END;
+
 CREATE TRIGGER IF NOT EXISTS key_records_status_guard
 BEFORE UPDATE ON key_records
 FOR EACH ROW
@@ -1048,6 +1062,22 @@ class AuthorizationDatabase:
                 self._migrate_table_to_strict(connection, "issuers", "CREATE TABLE issuers (issuer_digest BLOB PRIMARY KEY CHECK(length(issuer_digest) = 32), issuer_epoch BLOB NOT NULL CHECK(length(issuer_epoch) = 8)) STRICT;")
                 self._migrate_table_to_strict(connection, "policies", "CREATE TABLE policies (policy_name TEXT PRIMARY KEY, policy_digest BLOB NOT NULL CHECK(length(policy_digest) = 32)) STRICT;")
                 self._migrate_table_to_strict(connection, "audit_events", "CREATE TABLE audit_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, previous_hash BLOB NOT NULL CHECK(length(previous_hash) = 32), event_hash BLOB NOT NULL CHECK(length(event_hash) = 32), payload BLOB NOT NULL) STRICT;")
+                connection.execute("""
+                    CREATE TRIGGER IF NOT EXISTS audit_events_update_guard
+                    BEFORE UPDATE ON audit_events
+                    FOR EACH ROW
+                    BEGIN
+                        SELECT RAISE(ABORT, 'audit_events is append-only');
+                    END;
+                """)
+                connection.execute("""
+                    CREATE TRIGGER IF NOT EXISTS audit_events_delete_guard
+                    BEFORE DELETE ON audit_events
+                    FOR EACH ROW
+                    BEGIN
+                        SELECT RAISE(ABORT, 'audit_events is append-only');
+                    END;
+                """)
 
                 connection.execute("PRAGMA user_version = 26;")
                 connection.commit()

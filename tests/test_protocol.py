@@ -226,6 +226,7 @@ class TestV26MasterCumulativeSuite(unittest.TestCase):
 
         # Tail deletion: Delete newest event 2
         conn = self.db.connect()
+        conn.execute("DROP TRIGGER IF EXISTS audit_events_delete_guard")
         conn.execute("DELETE FROM audit_events WHERE sequence = 2")
         conn.close()
 
