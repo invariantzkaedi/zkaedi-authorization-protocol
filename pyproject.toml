@@ -51,7 +51,7 @@ dev = [
 ]
 
 [project.scripts]
-zkaedi-verify = "src.verify_cli:main"
+zkaedi-verify = "zkaedi.verify_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/invariantzkaedi/zkaedi-authorization-protocol"
@@ -60,7 +60,7 @@ Repository = "https://github.com/invariantzkaedi/zkaedi-authorization-protocol"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["zkaedi*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

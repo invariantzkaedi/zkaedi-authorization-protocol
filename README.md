@@ -26,7 +26,7 @@ Install the existing dependencies with `pip install -r requirements.txt`, then s
 import os
 from fastapi import FastAPI
 from pydantic import BaseModel
-from src.audited import audited, ZkaediMiddleware
+from zkaedi import audited, ZkaediMiddleware, file_checkpoint_sink
 
 class RefundRequest(BaseModel):
     amount_minor: int
@@ -37,6 +37,7 @@ app.add_middleware(
     service_name="billing-service",
     sqlite_path="/var/data/audit_vault.db",
     key_encryption_key=os.environ["ZKAEDI_KEY_ENCRYPTION_KEY"],
+    checkpoint_sink=file_checkpoint_sink("/var/log/checkpoints.jsonl"),
 )
 
 @app.post("/api/v1/payouts/{account_id}/refund")
@@ -48,7 +49,7 @@ async def refund_customer(account_id: str, payload: RefundRequest):
 Successful responses include a signed receipt and the associated chain position. Verify the persisted audit database offline with **zero secrets**:
 
 ```console
-$ python -m src.verify_cli /var/data/audit_vault.db --trusted-keys pinned_keys.json
+$ zkaedi-verify /var/data/audit_vault.db --trusted-keys pinned_keys.json
 PASS: 1 audit events and 1 Ed25519 receipts verified
 Chain head: fba87da299df996e8bde412e3d0bcbde78d4c4b4b695fdb4cdb06f1c80ffbf86
 ```

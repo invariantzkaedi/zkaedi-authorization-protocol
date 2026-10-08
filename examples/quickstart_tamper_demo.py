@@ -25,7 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
-from src.audited import audited, file_checkpoint_sink, ZkaediMiddleware
+from zkaedi import audited, file_checkpoint_sink, ZkaediMiddleware
 
 DB_PATH = "demo_audit_vault.db"
 CHECKPOINT_PATH = "demo_checkpoints.jsonl"
@@ -107,7 +107,7 @@ def main():
         [
             sys.executable,
             "-m",
-            "src.verify_cli",
+            "zkaedi.verify_cli",
             DB_PATH,
             "--trusted-keys",
             PINNED_KEYS_PATH,
@@ -135,7 +135,7 @@ def main():
         [
             sys.executable,
             "-m",
-            "src.verify_cli",
+            "zkaedi.verify_cli",
             DB_PATH,
             "--trusted-keys",
             PINNED_KEYS_PATH,
