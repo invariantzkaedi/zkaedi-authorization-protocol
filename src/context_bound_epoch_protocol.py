@@ -1406,17 +1406,27 @@ class AuthorizationDatabase:
     def append_audit_log(
         self,
         connection: sqlite3.Connection,
-        audit_key: bytes,
-        event_dict: Mapping[str, Any],
+        audit_key_or_event: bytes | None | Mapping[str, Any],
+        event_dict: Mapping[str, Any] | None = None,
     ) -> bytes:
-        payload = canonical_json_object(event_dict)
+        if event_dict is None:
+            if not isinstance(audit_key_or_event, Mapping):
+                raise ValueError("event_dict must be a mapping")
+            payload = canonical_json_object(audit_key_or_event)
+            audit_key = None
+        else:
+            audit_key = audit_key_or_event
+            payload = canonical_json_object(event_dict)
         if len(payload) > MAX_AUDIT_PAYLOAD_BYTES:
             raise ValueError("audit log payload exceeds maximum size")
         last_row = connection.execute(
             "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
         ).fetchone()
         previous_hash = last_row[0] if last_row is not None else b"\x00" * SHA256_SIZE
-        event_hash = hmac.digest(audit_key, previous_hash + payload, hashlib.sha256)
+        if audit_key is not None:
+            event_hash = hmac.digest(audit_key, previous_hash + payload, hashlib.sha256)
+        else:
+            event_hash = hashlib.sha256(previous_hash + payload).digest()
         connection.execute(
             "INSERT INTO audit_events(previous_hash, event_hash, payload) VALUES(?, ?, ?)",
             (previous_hash, event_hash, payload),
@@ -1425,11 +1435,11 @@ class AuthorizationDatabase:
 
     def verify_audit_log(
         self,
-        audit_key: bytes,
+        audit_key: bytes | None = None,
         trusted_checkpoint: tuple[int, bytes] | None = None,
     ) -> tuple[bool, int, bytes]:
         """Strictly verifies audit log chain. Genesis checkpoint MUST be (0, 32_zero_bytes)."""
-        if not isinstance(audit_key, bytes) or len(audit_key) < 32:
+        if audit_key is not None and (not isinstance(audit_key, bytes) or len(audit_key) < 32):
             raise ValueError("audit_key must contain at least 32 bytes")
 
         if trusted_checkpoint is not None:
@@ -1467,7 +1477,10 @@ class AuthorizationDatabase:
             for seq, prev_hash, ev_hash, payload in rows:
                 if not hmac.compare_digest(prev_hash, expected_prev):
                     return (False, count, latest_hash)
-                computed_ev_hash = hmac.digest(audit_key, prev_hash + payload, hashlib.sha256)
+                if audit_key is not None:
+                    computed_ev_hash = hmac.digest(audit_key, prev_hash + payload, hashlib.sha256)
+                else:
+                    computed_ev_hash = hashlib.sha256(prev_hash + payload).digest()
                 if not hmac.compare_digest(ev_hash, computed_ev_hash):
                     return (False, count, latest_hash)
                 

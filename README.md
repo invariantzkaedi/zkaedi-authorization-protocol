@@ -14,13 +14,13 @@
 Anyone with database or log-collector access can silently alter ordinary audit logs. Auditors increasingly ask for evidence that records have not been changed after the fact. ZKAEDI adds independently verifiable proofs to application actions:
 
 - **Ed25519 commit receipts** bind an action and its result to a registered signing key.
-- **Append-only HMAC hash chain** detects modifications and breaks in event order.
-- **Offline verifier** checks the chain and receipt signatures without trusting the running service.
-- **Replay idempotency** returns the original response and receipt for an identical request.
+- **Append-only SHA-256 hash chain** detects modifications and breaks in event order.
+- **Zero-secret offline verifier** checks the chain and receipt signatures with **zero secrets**—no shared keys or environment variables needed.
+- **Replay idempotency** returns the original response and receipt for an identical request without double-executing.
 
 ## ⚡ Quickstart (60 seconds)
 
-Install the existing dependencies with `pip install -r requirements.txt`, then set `ZKAEDI_AUDIT_KEY` to at least 32 bytes represented as hexadecimal:
+Install the existing dependencies with `pip install -r requirements.txt`, then set `ZKAEDI_KEY_ENCRYPTION_KEY` (a 32-byte hex key used to protect signing keys at rest):
 
 ```python
 import os
@@ -36,7 +36,7 @@ app.add_middleware(
     ZkaediMiddleware,
     service_name="billing-service",
     sqlite_path="/var/data/audit_vault.db",
-    audit_key=os.environ["ZKAEDI_AUDIT_KEY"],
+    key_encryption_key=os.environ["ZKAEDI_KEY_ENCRYPTION_KEY"],
 )
 
 @app.post("/api/v1/payouts/{account_id}/refund")
@@ -45,15 +45,15 @@ async def refund_customer(account_id: str, payload: RefundRequest):
     return {"status": "ok"}
 ```
 
-Successful responses include a signed receipt and the associated chain position. Verify the persisted audit database offline:
+Successful responses include a signed receipt and the associated chain position. Verify the persisted audit database offline with **zero secrets**:
 
 ```console
-$ python -m src.verify_cli /var/data/audit_vault.db --checkpoint <64-hex-chain-head>
+$ python -m src.verify_cli /var/data/audit_vault.db
 PASS: 1 audit events and 1 Ed25519 receipts verified
-Chain head: <64-hex-chain-head>
+Chain head: fba87da299df996e8bde412e3d0bcbde78d4c4b4b695fdb4cdb06f1c80ffbf86
 ```
 
-The CLI reads `ZKAEDI_AUDIT_KEY` from the environment. The checkpoint, when supplied, must match the current chain head.
+Optional: supply `--checkpoint <64-hex-chain-head>` to assert the chain matches an externally published checkpoint.
 
 ## Use cases
 

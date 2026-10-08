@@ -1,35 +1,123 @@
-# ZKAEDI protocol specification (outline)
+# ZKAEDI Protocol Specification
 
-## Scope
+## 1. Scope & System Overview
 
-This document outlines the existing credential protocol and the `@audited` action-receipt API. It is an implementation guide, not a substitute for reviewing the code and test vectors.
+This specification details the wire formats, cryptographic constructions, hash chaining rules, receipt mechanisms, and key lifecycle management in the ZKAEDI framework.
 
-## Credential token wire format
+---
 
-The fixed-size credential envelope, field offsets, sizes, and interpretation are documented in the [README token wire format table](../README.md#-249-byte-token-wire-format-specification). It includes a protocol version, key identifier, packed epoch state, time bounds, issuer/principal/context/policy digests, and an Ed25519 signature. The current source constants and codec are authoritative for exact encoding and validation.
+## 2. Canonical Audited Context
 
-## Canonical audited context
+When a request enters an `@audited` endpoint:
+1. **Context Construction**: The middleware extracts:
+   - `principal_id`: Resolved via `principal_resolver(request)` (defaults to `X-Principal-Id` header or `"anonymous"`).
+   - `action`: Explicit action string passed to `@audited(action="...")`.
+   - `resource`: Parameter name resolved from request path/query/body.
+   - `payload`: Normalized request body dictionary.
+2. **Context Digest**: The canonical JSON representation (`canonical_json_object`) is computed, sorted by keys without whitespace delimiters, and digested:
+   ```text
+   context_digest = SHA-256(canonical_json(context))
+   ```
+3. **Response Digest**: Upon handler completion, response payload bytes are digested:
+   ```text
+   response_digest = SHA-256(response_bytes)
+   ```
 
-The audited API canonicalizes a JSON object containing `principal_id`, `action`, the configured resource argument's value, and the parsed request body with `canonical_json_object`. Its SHA-256 digest binds the request context. Response bytes are separately SHA-256 hashed.
+---
 
-## Audit hash chain
+## 3. Public Audit Hash Chain
 
-An `audit_events` row contains a monotonically assigned sequence, the previous 32-byte hash, the current 32-byte hash, and canonical JSON payload bytes. Genesis is 32 zero bytes; for each event the implementation computes:
-
-```text
-event_hash = HMAC-SHA256(audit_key, previous_hash || payload)
+Audit events are stored in the `audit_events` SQLite table with `STRICT` typing:
+```sql
+CREATE TABLE audit_events(
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    previous_hash BLOB NOT NULL,
+    event_hash BLOB NOT NULL,
+    payload BLOB NOT NULL
+) STRICT;
 ```
 
-Updates and deletions are blocked by SQLite triggers, but a database owner can remove triggers or alter the database file. Consumers should retain checkpoints outside the database and verify exports independently.
+### Hash Chaining Formula
+The hash chain is public and unkeyed:
+- **Genesis Block**: Sequence 1 uses `previous_hash = 0x00 * 32` (32 zero bytes).
+- **Subsequent Blocks**:
+  ```text
+  event_hash = SHA-256(previous_hash || canonical_payload)
+  ```
+Because the hash chain is unkeyed SHA-256, any external observer or auditor can verify the mathematical continuity of the entire log without possession of any shared secrets.
 
-## Action receipt
+---
 
-An audit event is signed by an active Ed25519 key registered with purpose `receipt_signing`. The signed canonical JSON includes service, sequence, chain-entry hash, context digest, response digest, and status. The signature, signing key ID, and signed payload are stored separately in `zkaedi_receipts` to avoid making the chain hash circular. HTTP success responses carry base64 signature, sequence, event hash, and key ID headers.
+## 4. Ed25519 Action Receipts
 
-## Key lifecycle and verifier
+To bind the event to a cryptographic identity and prevent unauthorized additions by non-service entities, each audit event is accompanied by an Ed25519 action receipt.
 
-Receipt private seeds are encrypted with AES-GCM using a key derived from the configured audit key and service name; encrypted seeds and key metadata are stored in SQLite. Protect and rotate the audit key as a secret. The verifier reads the audit key from `ZKAEDI_AUDIT_KEY`, recomputes HMACs, and verifies every registered receipt signature. An optional checkpoint compares the supplied chain-head hash with the verified final hash.
+### Receipt Structure
+The receipt signs the canonical JSON receipt payload:
+```json
+{
+  "service": "billing-service",
+  "sequence": 42,
+  "entry_hash": "<64-hex-event_hash>",
+  "context_digest": "<64-hex-context_digest>",
+  "response_digest": "<64-hex-response_digest>",
+  "status": 200
+}
+```
+The Ed25519 signature is computed over `canonical_json(receipt_payload)`.
 
-## Idempotency
+### Storage & Response Headers
+The receipt is stored in `zkaedi_receipts`:
+```sql
+CREATE TABLE zkaedi_receipts(
+    sequence INTEGER PRIMARY KEY,
+    key_id BLOB NOT NULL,
+    signature BLOB NOT NULL,
+    signed_payload BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+```
+Successful HTTP responses emit:
+- `X-Zkaedi-Receipt-Signature`: Base64-encoded 64-byte Ed25519 signature.
+- `X-Zkaedi-Sequence`: Decimal integer sequence number.
+- `X-Zkaedi-Event-Hash`: Hex-encoded 32-byte event hash.
+- `X-Zkaedi-Key-Id`: Hex-encoded 16-byte signing key ID.
 
-An `Idempotency-Key` is reserved before handler execution and associated with the context digest. Matching committed keys replay the stored response and original receipt headers. A conflicting context or an in-progress key returns HTTP 409.
+---
+
+## 5. Key Lifecycle & KEK Isolation
+
+### Key-Encryption Key (KEK)
+The Ed25519 private seed is encrypted at rest using AES-256-GCM. The encryption key is derived exclusively using HKDF/HMAC from the `ZKAEDI_KEY_ENCRYPTION_KEY`:
+```text
+KEK = HMAC-SHA256(ZKAEDI_KEY_ENCRYPTION_KEY, "zkaedi-receipt-private-key-v1\x00" || service_name)
+```
+- **Isolation Guarantee**: The KEK is never stored in the database and never transmitted to auditors or external verifiers.
+- **Key Registration**: The public key is stored in `key_records` with purpose `receipt_signing` and state `ACTIVE`.
+
+### Rotation States
+Keys transition monotonically:
+```text
+ACTIVE -> VERIFY_ONLY -> RETIRED
+```
+Native SQLite trigger `key_records_status_guard` blocks illegal transitions.
+
+---
+
+## 6. Offline Zero-Secret Verifier & Checkpoints
+
+The offline verification CLI (`src/verify_cli.py`) operates with **zero secrets**:
+1. Connects to SQLite in read-only mode (`?mode=ro`).
+2. Iterates rows in `audit_events` from `sequence = 1` upward.
+3. Verifies `previous_hash == expected_previous` and `event_hash == SHA-256(previous_hash || payload)`.
+4. Retrieves the registered public key from `key_records` for each receipt in `zkaedi_receipts` and validates the Ed25519 signature over `signed_payload`.
+5. Validates that `signed_payload` matches the event fields and `entry_hash`.
+6. (Optional) If `--checkpoint <hex>` is provided, verifies that the final chain head matches the trusted checkpoint.
+
+---
+
+## 7. External Checkpoint Anchoring
+
+To protect against tail truncation or total database destruction:
+- `AuditRecorder.export_checkpoint()` returns `{sequence, chain_head, receipt_signature, key_id, service, timestamp}`.
+- `ZkaediMiddleware(checkpoint_sink=...)` invokes an external callback on every committed mutation, enabling immediate streaming of checkpoints to external syslog, S3 Object Lock, or SIEM pipelines.

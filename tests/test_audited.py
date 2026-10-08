@@ -238,14 +238,15 @@ def test_offline_verifier_detects_tampering(tmp_path: Path) -> None:
     valid, _, _, _ = verify_database(str(db_path), b"a" * 32, "nope")
     assert not valid
 
-    with patch.dict(os.environ, {"ZKAEDI_AUDIT_KEY": (b"a" * 32).hex()}):
-        assert verify_main([str(db_path)]) == 0
     with patch.dict(os.environ, {}, clear=True):
-        assert verify_main([str(db_path)]) == 1
+        assert verify_main([str(db_path)]) == 0
     with patch.dict(os.environ, {"ZKAEDI_AUDIT_KEY": "not-hex"}):
         assert verify_main([str(db_path)]) == 1
     with patch.dict(os.environ, {"ZKAEDI_AUDIT_KEY": "00"}):
         assert verify_main([str(db_path)]) == 1
+    assert verify_main([str(db_path), "--audit-key", "not-hex"]) == 1
+    assert verify_main([str(db_path), "--audit-key", "00"]) == 1
+    assert verify_main([str(db_path)]) == 0
     with patch.dict(os.environ, {"ZKAEDI_AUDIT_KEY": (b"a" * 32).hex()}):
         with patch.object(sys, "argv", ["verify_cli", str(db_path)]):
             try:
@@ -512,7 +513,7 @@ def test_verifier_rejects_malformed_chain_receipts_and_schema(tmp_path: Path, mo
     assert not verify_database(str(path), audit_key)[0]
 
     malformed = b"not-json"
-    malformed_hash = hmac.digest(audit_key, event[0] + malformed, hashlib.sha256)
+    malformed_hash = hashlib.sha256(event[0] + malformed).digest()
     connection = sqlite3.connect(path)
     connection.execute(
         "UPDATE audit_events SET event_hash = ?, payload = ? WHERE sequence = 1",
@@ -601,3 +602,46 @@ def test_decorator_without_middleware_is_transparent() -> None:
 
     anyio.run(invoke, backend="asyncio")
     assert sync_operation("sync") == "sync"
+
+
+def test_checkpoint_sink_and_export_checkpoint(tmp_path: Path) -> None:
+    db_path = tmp_path / "checkpointed.db"
+    captured_checkpoints: list[dict[str, Any]] = []
+
+    app = FastAPI()
+    app.add_middleware(
+        ZkaediMiddleware,
+        service_name="checkpoint-service",
+        sqlite_path=db_path,
+        key_encryption_key=b"k" * 32,
+        checkpoint_sink=lambda cp: captured_checkpoints.append(cp),
+    )
+
+    @app.post("/action/{item_id}")
+    @audited(action="action.create", resource="item_id")
+    def create_action(item_id: str):
+        return {"status": "created", "item_id": item_id}
+
+    recorder = AuditRecorder(tmp_path / "empty.db", "empty-svc", key_encryption_key=b"e" * 32)
+    empty_cp = recorder.export_checkpoint()
+    assert empty_cp["sequence"] == 0
+    assert empty_cp["chain_head"] == "00" * 32
+    assert empty_cp["receipt_signature"] is None
+
+    with TestClient(app) as client:
+        res = client.post("/action/first")
+        assert res.status_code == 200
+        res2 = client.post("/action/second")
+        assert res2.status_code == 200
+
+    assert len(captured_checkpoints) == 2
+    assert captured_checkpoints[0]["sequence"] == 1
+    assert captured_checkpoints[1]["sequence"] == 2
+    head_hash = captured_checkpoints[1]["chain_head"]
+
+    # Verify offline with zero secrets using the anchored checkpoint
+    with patch.dict(os.environ, {}, clear=True):
+        assert verify_main([str(db_path), "--checkpoint", head_hash]) == 0
+        # If someone provides a mismatched checkpoint, it fails
+        assert verify_main([str(db_path), "--checkpoint", "f" * 64]) == 1
+

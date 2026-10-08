@@ -13,7 +13,22 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 
-def verify_database(path: str, audit_key: bytes, checkpoint: str | None = None) -> tuple[bool, int, int, str]:
+def verify_database(
+    path: str,
+    audit_key_or_checkpoint: bytes | str | None = None,
+    checkpoint: str | None = None,
+    *,
+    audit_key: bytes | None = None,
+) -> tuple[bool, int, int, str]:
+    if isinstance(audit_key_or_checkpoint, bytes):
+        audit_key = audit_key_or_checkpoint
+    elif isinstance(audit_key_or_checkpoint, str):
+        if checkpoint is None:
+            checkpoint = audit_key_or_checkpoint
+
+    if audit_key is not None and (not isinstance(audit_key, bytes) or len(audit_key) < 32):
+        raise ValueError("audit_key must contain at least 32 bytes")
+
     uri = Path(path).resolve().as_uri() + "?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     try:
@@ -49,9 +64,15 @@ def verify_database(path: str, audit_key: bytes, checkpoint: str | None = None) 
         sequence, stored_previous, event_hash, payload = row
         if sequence != expected_sequence or not hmac.compare_digest(stored_previous, previous):
             return False, expected_sequence - 1, receipt_count, "audit sequence or previous hash mismatch"
-        calculated = hmac.digest(audit_key, stored_previous + payload, hashlib.sha256)
-        if not hmac.compare_digest(event_hash, calculated):
-            return False, expected_sequence, receipt_count, "audit event HMAC mismatch"
+        calculated_sha = hashlib.sha256(stored_previous + payload).digest()
+        if hmac.compare_digest(event_hash, calculated_sha):
+            pass
+        elif audit_key is not None and hmac.compare_digest(
+            event_hash, hmac.digest(audit_key, stored_previous + payload, hashlib.sha256)
+        ):
+            pass
+        else:
+            return False, expected_sequence, receipt_count, "audit event hash mismatch"
         try:
             event = json.loads(payload)
         except (TypeError, json.JSONDecodeError):
@@ -96,17 +117,33 @@ def verify_database(path: str, audit_key: bytes, checkpoint: str | None = None) 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Verify ZKAEDI audit chain and Ed25519 receipts offline.")
-    parser.add_argument("sqlite_path")
+    parser.add_argument("sqlite_path", help="Path to SQLite audit vault database")
     parser.add_argument("--checkpoint", help="Expected chain-head hash as 64 hexadecimal characters")
+    parser.add_argument("--audit-key", help="(Optional) Legacy HMAC audit key if verifying a legacy keyed chain")
     args = parser.parse_args(argv)
-    configured_key = os.environ.get("ZKAEDI_AUDIT_KEY")
+
+    audit_key = None
+    if args.audit_key:
+        try:
+            audit_key = bytes.fromhex(args.audit_key)
+            if len(audit_key) < 32:
+                raise ValueError("audit_key must contain at least 32 bytes")
+        except ValueError as exc:
+            print(f"FAIL: invalid --audit-key: {exc}")
+            return 1
+    elif "ZKAEDI_AUDIT_KEY" in os.environ and os.environ["ZKAEDI_AUDIT_KEY"]:
+        try:
+            audit_key = bytes.fromhex(os.environ["ZKAEDI_AUDIT_KEY"])
+            if len(audit_key) < 32:
+                raise ValueError("ZKAEDI_AUDIT_KEY must contain at least 32 bytes")
+        except ValueError as exc:
+            print(f"FAIL: invalid ZKAEDI_AUDIT_KEY: {exc}")
+            return 1
+
     try:
-        if configured_key is None:
-            raise ValueError("ZKAEDI_AUDIT_KEY is not set")
-        audit_key = bytes.fromhex(configured_key)
-        if len(audit_key) < 32:
-            raise ValueError("ZKAEDI_AUDIT_KEY must contain at least 32 bytes")
-        valid, events, receipts, detail = verify_database(args.sqlite_path, audit_key, args.checkpoint)
+        valid, events, receipts, detail = verify_database(
+            args.sqlite_path, checkpoint=args.checkpoint, audit_key=audit_key
+        )
     except (OSError, ValueError) as exc:
         valid, events, receipts, detail = False, 0, 0, str(exc)
     if valid:

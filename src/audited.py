@@ -83,29 +83,37 @@ class AuditRecorder:
         self,
         sqlite_path: str | os.PathLike[str],
         service_name: str,
+        key_encryption_key: bytes | str | None = None,
+        *,
         audit_key: bytes | str | None = None,
     ) -> None:
         if not service_name:
             raise ValueError("service_name must be non-empty")
-        if audit_key is None:
-            audit_key = os.environ.get("ZKAEDI_AUDIT_KEY")
-        if isinstance(audit_key, str):
+        kek = key_encryption_key
+        if kek is None:
+            kek = os.environ.get("ZKAEDI_KEY_ENCRYPTION_KEY")
+        if kek is None and audit_key is not None:
+            kek = audit_key
+        if kek is None:
+            kek = os.environ.get("ZKAEDI_AUDIT_KEY")
+        if isinstance(kek, str):
             try:
-                audit_key = bytes.fromhex(audit_key)
+                kek = bytes.fromhex(kek)
             except ValueError as exc:
-                raise ValueError("ZKAEDI_AUDIT_KEY must be a hexadecimal key") from exc
-        if not isinstance(audit_key, bytes) or len(audit_key) < 32:
-            raise ValueError("audit_key must contain at least 32 bytes")
+                raise ValueError("key_encryption_key must be a hexadecimal key") from exc
+        if not isinstance(kek, bytes) or len(kek) < 32:
+            raise ValueError("key_encryption_key must contain at least 32 bytes")
         self.database = AuthorizationDatabase(sqlite_path)
         self.service_name = service_name
-        self.audit_key = bytes(audit_key)
+        self.key_encryption_key = bytes(kek)
+        self.audit_key = self.key_encryption_key
         self.keyring = Ed25519KeyRing(KeyPurpose.RECEIPT_SIGNING, database=self.database)
         self._initialize_tables()
         self.key_id = self._load_or_create_key()
 
     def _encryption_key(self) -> bytes:
         return hmac.digest(
-            self.audit_key,
+            self.key_encryption_key,
             b"zkaedi-receipt-private-key-v1\x00" + self.service_name.encode("utf-8"),
             hashlib.sha256,
         )
@@ -276,7 +284,7 @@ class AuditRecorder:
         connection = self.database.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            entry_hash = self.database.append_audit_log(connection, self.audit_key, event)
+            entry_hash = self.database.append_audit_log(connection, event)
             sequence = int(
                 connection.execute("SELECT last_insert_rowid()").fetchone()[0]
             )
@@ -321,6 +329,36 @@ class AuditRecorder:
         except Exception:
             connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    def export_checkpoint(self) -> dict[str, Any]:
+        """Exports the latest signed chain head for external immutable anchoring."""
+        connection = self.database.connect()
+        try:
+            row = connection.execute(
+                "SELECT a.sequence, a.event_hash, r.signature, r.key_id "
+                "FROM audit_events a "
+                "JOIN zkaedi_receipts r ON r.sequence = a.sequence "
+                "ORDER BY a.sequence DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return {
+                    "sequence": 0,
+                    "chain_head": "00" * 32,
+                    "receipt_signature": None,
+                    "key_id": None,
+                    "service": self.service_name,
+                    "timestamp": int(time.time()),
+                }
+            return {
+                "sequence": row[0],
+                "chain_head": row[1].hex(),
+                "receipt_signature": base64.b64encode(row[2]).decode("ascii"),
+                "key_id": row[3].hex(),
+                "service": self.service_name,
+                "timestamp": int(time.time()),
+            }
         finally:
             connection.close()
 
@@ -463,14 +501,19 @@ class ZkaediMiddleware:
         *,
         service_name: str,
         sqlite_path: str | os.PathLike[str],
+        key_encryption_key: bytes | str | None = None,
         audit_key: bytes | str | None = None,
         principal_resolver: Callable[[Any], str] | None = None,
+        checkpoint_sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.app = app
-        self.recorder = AuditRecorder(sqlite_path, service_name, audit_key)
+        self.recorder = AuditRecorder(
+            sqlite_path, service_name, key_encryption_key, audit_key=audit_key
+        )
         self.principal_resolver = principal_resolver or (
             lambda request: request.headers.get("X-Principal-Id", "anonymous")
         )
+        self.checkpoint_sink = checkpoint_sink
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -576,6 +619,11 @@ class ZkaediMiddleware:
                         severity=context.severity,
                     )
                     context.recorded = True
+                    if self.checkpoint_sink is not None:
+                        try:
+                            self.checkpoint_sink(self.recorder.export_checkpoint())
+                        except Exception:
+                            pass
                     response_messages[0] = {
                         **response_messages[0],
                         "headers": response_headers
