@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import contextvars
 import hashlib
@@ -20,9 +19,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 from fastapi import HTTPException
-from fastapi.encoders import jsonable_encoder
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import JSONResponse, Response
+from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src.context_bound_epoch_protocol import (
@@ -61,6 +59,15 @@ class _RequestContext:
     recorder: "AuditRecorder"
     principal_resolver: Callable[[Any], str]
     receipt: AuditReceipt | None = None
+    action: str | None = None
+    resource: Any = None
+    principal_id: str | None = None
+    digest: bytes | None = None
+    idempotency_key: str | None = None
+    severity: str = "INFO"
+    started: float | None = None
+    recorded: bool = False
+    replayed: bool = False
 
 
 _request_context: contextvars.ContextVar[_RequestContext | None] = contextvars.ContextVar(
@@ -330,6 +337,37 @@ def _replay_response(serialized: bytes) -> Response:
     )
 
 
+def _prepare_audit(
+    context: _RequestContext,
+    signature: inspect.Signature,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    action: str,
+    resource: str,
+    severity: str,
+) -> Response | None:
+    bound = signature.bind_partial(*args, **kwargs)
+    resource_value = bound.arguments.get(resource)
+    principal_id = context.principal_resolver(context.request)
+    digest = context.recorder.context_digest(
+        principal_id, action, resource_value, context.body
+    )
+    idempotency_key = context.request.headers.get("Idempotency-Key")
+    if idempotency_key:
+        cached_response = context.recorder.lookup_idempotency(idempotency_key, digest)
+        if cached_response is not None:
+            context.replayed = True
+            return _replay_response(cached_response)
+    context.action = action
+    context.resource = resource_value
+    context.principal_id = principal_id
+    context.digest = digest
+    context.idempotency_key = idempotency_key
+    context.severity = severity
+    context.started = time.perf_counter()
+    return None
+
+
 def audited(
     *,
     action: str,
@@ -346,32 +384,37 @@ def audited(
                 context = _request_context.get()
                 if context is None:
                     return await function(*args, **kwargs)
-                started = time.perf_counter()
-                bound = signature.bind_partial(*args, **kwargs)
-                resource_value = bound.arguments.get(resource)
-                principal_id = context.principal_resolver(context.request)
-                digest = context.recorder.context_digest(principal_id, action, resource_value, context.body)
-                idem_key = context.request.headers.get("Idempotency-Key")
                 try:
-                    if idem_key:
-                        cached = context.recorder.lookup_idempotency(idem_key, digest)
-                        if cached is not None:
-                            return _replay_response(cached)
-                    result = await function(*args, **kwargs)
+                    replay = _prepare_audit(
+                        context, signature, args, kwargs, action, resource, severity
+                    )
                 except IdempotencyConflict as exc:
                     raise HTTPException(status_code=409, detail="Idempotency-Key conflict or request in progress") from exc
+                if replay is not None:
+                    return replay
+                try:
+                    return await function(*args, **kwargs)
                 except Exception:
+                    context.recorded = True
                     try:
-                        context.recorder.record(
-                            principal_id=principal_id, action=action, resource=resource_value,
-                            request_body=context.body, status_code="ERROR", response_body=b"",
-                            latency_ms=(time.perf_counter() - started) * 1000,
-                            context_digest=digest, severity=severity,
+                        await run_in_threadpool(
+                            context.recorder.record,
+                            principal_id=context.principal_id,
+                            action=action,
+                            resource=context.resource,
+                            request_body=context.body,
+                            status_code="ERROR",
+                            response_body=b"",
+                            latency_ms=(time.perf_counter() - context.started) * 1000,
+                            context_digest=context.digest,
+                            severity=severity,
                         )
                     finally:
-                        context.recorder.discard_idempotency(idem_key)
+                        await run_in_threadpool(
+                            context.recorder.discard_idempotency,
+                            context.idempotency_key,
+                        )
                     raise
-                return execute_result(context, result, principal_id, resource_value, digest, idem_key, started, action, severity)
 
             return async_wrapper
 
@@ -380,75 +423,36 @@ def audited(
             context = _request_context.get()
             if context is None:
                 return function(*args, **kwargs)
-            started = time.perf_counter()
-            bound = signature.bind_partial(*args, **kwargs)
-            resource_value = bound.arguments.get(resource)
-            principal_id = context.principal_resolver(context.request)
-            digest = context.recorder.context_digest(principal_id, action, resource_value, context.body)
-            idem_key = context.request.headers.get("Idempotency-Key")
             try:
-                if idem_key:
-                    cached = context.recorder.lookup_idempotency(idem_key, digest)
-                    if cached is not None:
-                        return _replay_response(cached)
-                result = function(*args, **kwargs)
+                replay = _prepare_audit(
+                    context, signature, args, kwargs, action, resource, severity
+                )
             except IdempotencyConflict as exc:
                 raise HTTPException(status_code=409, detail="Idempotency-Key conflict or request in progress") from exc
+            if replay is not None:
+                return replay
+            try:
+                return function(*args, **kwargs)
             except Exception:
+                context.recorded = True
                 try:
                     context.recorder.record(
-                        principal_id=principal_id, action=action, resource=resource_value,
-                        request_body=context.body, status_code="ERROR", response_body=b"",
-                        latency_ms=(time.perf_counter() - started) * 1000,
-                        context_digest=digest, severity=severity,
+                        principal_id=context.principal_id,
+                        action=action,
+                        resource=context.resource,
+                        request_body=context.body,
+                        status_code="ERROR",
+                        response_body=b"",
+                        latency_ms=(time.perf_counter() - context.started) * 1000,
+                        context_digest=context.digest,
+                        severity=severity,
                     )
                 finally:
-                    context.recorder.discard_idempotency(idem_key)
+                    context.recorder.discard_idempotency(context.idempotency_key)
                 raise
-            return execute_result(context, result, principal_id, resource_value, digest, idem_key, started, action, severity)
 
         return async_wrapper if inspect.iscoroutinefunction(function) else sync_wrapper
     return decorate
-
-
-def execute_result(
-    context: _RequestContext,
-    result: Any,
-    principal_id: str,
-    resource_value: Any,
-    digest: bytes,
-    idem_key: str | None,
-    started: float,
-    action: str,
-    severity: str,
-) -> Any:
-    try:
-        if isinstance(result, Response):
-            body = bytes(result.body or b"")
-            status_code = result.status_code
-            headers = list(result.headers.items())
-            media_type = result.media_type
-        else:
-            response = JSONResponse(content=jsonable_encoder(result))
-            body, status_code, headers, media_type = response.body, response.status_code, [], "application/json"
-        cache = canonical_json_object(
-            {
-                "status_code": status_code,
-                "headers": headers,
-                "media_type": media_type,
-                "body": base64.b64encode(body).decode("ascii"),
-            }
-        )
-        context.receipt = context.recorder.record(
-            principal_id=principal_id, action=action, resource=resource_value,
-            request_body=context.body, status_code=status_code, response_body=body,
-            latency_ms=(time.perf_counter() - started) * 1000, context_digest=digest,
-            idempotency_key=idem_key, cached_response=cache if idem_key else None, severity=severity,
-        )
-    except Exception as exc:
-        context.recorder.discard_idempotency(idem_key)
-        raise HTTPException(status_code=500, detail="Audit receipt could not be committed") from exc
-    return result
 
 
 class ZkaediMiddleware:
@@ -499,15 +503,89 @@ class ZkaediMiddleware:
                 return message
             return await receive()
 
+        response_messages: list[Message] = []
+        response_status = 500
+        response_headers: list[tuple[bytes, bytes]] = []
+        response_body: list[bytes] = []
+
         async def send_with_receipt(message: Message) -> None:
-            if message["type"] == "http.response.start" and context.receipt is not None:
-                headers = list(message.get("headers", []))
-                headers.extend(
-                    (name.lower().encode("ascii"), value.encode("ascii"))
-                    for name, value in context.receipt.headers().items()
-                )
-                message = {**message, "headers": headers}
-            await send(message)
+            nonlocal response_status, response_headers
+            if context.action is None or context.recorded or context.replayed:
+                await send(message)
+                return
+            response_messages.append(message)
+            if message["type"] == "http.response.start":
+                response_status = message["status"]
+                response_headers = list(message.get("headers", []))
+            elif message["type"] == "http.response.body":
+                response_body.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+                body = b"".join(response_body)
+                cached_response = None
+                if context.idempotency_key:
+                    cached_response = canonical_json_object(
+                        {
+                            "status_code": response_status,
+                            "headers": [
+                                [name.decode("latin-1"), value.decode("latin-1")]
+                                for name, value in response_headers
+                            ],
+                            "media_type": next(
+                                (
+                                    value.decode("latin-1").split(";", 1)[0]
+                                    for name, value in response_headers
+                                    if name.lower() == b"content-type"
+                                ),
+                                None,
+                            ),
+                            "body": base64.b64encode(body).decode("ascii"),
+                        }
+                    )
+                try:
+                    context.receipt = await run_in_threadpool(
+                        context.recorder.record,
+                        principal_id=context.principal_id,
+                        action=context.action,
+                        resource=context.resource,
+                        request_body=context.body,
+                        status_code=response_status,
+                        response_body=body,
+                        latency_ms=(time.perf_counter() - context.started) * 1000,
+                        context_digest=context.digest,
+                        idempotency_key=context.idempotency_key,
+                        cached_response=cached_response,
+                        severity=context.severity,
+                    )
+                    context.recorded = True
+                    response_messages[0] = {
+                        **response_messages[0],
+                        "headers": response_headers
+                        + [
+                            (name.lower().encode("ascii"), value.encode("ascii"))
+                            for name, value in context.receipt.headers().items()
+                        ],
+                    }
+                    for buffered in response_messages:
+                        await send(buffered)
+                except Exception:
+                    try:
+                        context.recorder.discard_idempotency(context.idempotency_key)
+                    except Exception:
+                        pass
+                    context.recorded = True
+                    body = b'{"detail":"Audit receipt could not be committed"}'
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 500,
+                            "headers": [
+                                (b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode("ascii")),
+                            ],
+                        }
+                    )
+                    await send({"type": "http.response.body", "body": body})
 
         try:
             await self.app(scope, replay_receive, send_with_receipt)
