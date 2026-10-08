@@ -1,4 +1,4 @@
-# ZKAEDI v26.0 Context-Bound Epoch Authorization Engine & REST Microservice
+# ZKAEDI — Cryptographic Action Receipts & Tamper-Evident Audit Trails
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![SQLite STRICT](https://img.shields.io/badge/SQLite-3.37%2B%20STRICT-green.svg)](https://www.sqlite.org/strictunpack.html)
@@ -6,6 +6,64 @@
 [![Coverage: 100%](https://img.shields.io/badge/coverage-100%25%20(ZD--100)-brightgreen.svg)](tests/test_zd100_coverage.py)
 [![Adversarial Fuzzing: 10,000 PASS](https://img.shields.io/badge/fuzzing-10%2C000%20mutations-success.svg)](tests/fuzz_adversarial_gauntlet.py)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> Receipts for your backend. Every sensitive mutation signed with Ed25519, chained in an append-only hash log, and verifiable offline.
+
+## Why ZKAEDI?
+
+Anyone with database or log-collector access can silently alter ordinary audit logs. Auditors increasingly ask for evidence that records have not been changed after the fact. ZKAEDI adds independently verifiable proofs to application actions:
+
+- **Ed25519 commit receipts** bind an action and its result to a registered signing key.
+- **Append-only HMAC hash chain** detects modifications and breaks in event order.
+- **Offline verifier** checks the chain and receipt signatures without trusting the running service.
+- **Replay idempotency** returns the original response and receipt for an identical request.
+
+## ⚡ Quickstart (60 seconds)
+
+Install the existing dependencies with `pip install -r requirements.txt`, then set `ZKAEDI_AUDIT_KEY` to at least 32 bytes represented as hexadecimal:
+
+```python
+import os
+from fastapi import FastAPI
+from pydantic import BaseModel
+from src.audited import audited, ZkaediMiddleware
+
+class RefundRequest(BaseModel):
+    amount_minor: int
+
+app = FastAPI()
+app.add_middleware(
+    ZkaediMiddleware,
+    service_name="billing-service",
+    sqlite_path="/var/data/audit_vault.db",
+    audit_key=os.environ["ZKAEDI_AUDIT_KEY"],
+)
+
+@app.post("/api/v1/payouts/{account_id}/refund")
+@audited(action="payout.refund", resource="account_id", severity="CRITICAL")
+async def refund_customer(account_id: str, payload: RefundRequest):
+    return {"status": "ok"}
+```
+
+Successful responses include a signed receipt and the associated chain position. Verify the persisted audit database offline:
+
+```console
+$ python -m src.verify_cli /var/data/audit_vault.db --checkpoint <64-hex-chain-head>
+PASS: 1 audit events and 1 Ed25519 receipts verified
+Chain head: <64-hex-chain-head>
+```
+
+The CLI reads `ZKAEDI_AUDIT_KEY` from the environment. The checkpoint, when supplied, must match the current chain head.
+
+## Use cases
+
+- SOC 2, HIPAA, and PCI audit trails for sensitive application mutations.
+- Fintech action receipts for payouts, refunds, and ledger operations.
+- AI-agent action logging where operators need a verifiable record of actions.
+
+See [docs/COMPLIANCE.md](docs/COMPLIANCE.md) for a careful control mapping.
+
+## Deep dive
 
 A zero-trust, fail-closed authorization, credential issuance, and linearizable ledger transaction engine written in Python and backed by SQLite 3.37+ in `STRICT` mode.
 
@@ -276,11 +334,18 @@ zkaedi-authorization-protocol/
 ├── LICENSE
 ├── README.md
 ├── requirements.txt
+├── docs/
+│   ├── COMPLIANCE.md
+│   ├── SPEC.md
+│   └── THREAT_MODEL.md
 ├── src/
 │   ├── __init__.py
 │   ├── api_service.py                   # FastAPI REST Microservice
-│   └── context_bound_epoch_protocol.py  # Core Protocol Engine (v26.0)
+│   ├── audited.py                       # Audited decorator, middleware, recorder
+│   ├── context_bound_epoch_protocol.py  # Core Protocol Engine (v26.0)
+│   └── verify_cli.py                    # Offline audit and receipt verifier
 └── tests/
+    ├── test_audited.py                  # Action receipt and middleware integration tests
     ├── benchmark_concurrency_latency.py # Vector 2: Concurrency & Latency Benchmarks
     ├── fuzz_adversarial_gauntlet.py     # Vector 1: 10,000 Adversarial Mutations
     ├── test_api_service.py              # Microservice Route & Integration Suite
@@ -290,7 +355,7 @@ zkaedi-authorization-protocol/
 
 ---
 
-## ⚡ Quickstart
+## Developing & running the full microservice
 
 ### Prerequisites
 - CPython 3.11+

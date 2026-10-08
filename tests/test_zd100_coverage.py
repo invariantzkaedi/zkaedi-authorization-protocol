@@ -1026,6 +1026,7 @@ class TestTGM5Vector4DegradedLedgerAndDatabase(unittest.TestCase):
 
         # Tamper second event hash
         conn = self.db.connect()
+        conn.execute("DROP TRIGGER IF EXISTS audit_events_update_guard")
         conn.execute("UPDATE audit_events SET event_hash = ? WHERE sequence = 2", (secrets.token_bytes(32),))
         conn.commit()
         conn.close()
