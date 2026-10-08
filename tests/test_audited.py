@@ -18,10 +18,14 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 import pytest
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from src.audited import AuditRecorder, IdempotencyConflict, ZkaediMiddleware, audited
-from src.context_bound_epoch_protocol import AuthorizationDatabase, canonical_json_object
+from src.context_bound_epoch_protocol import (
+    MAX_REQUEST_BYTES,
+    AuthorizationDatabase,
+    canonical_json_object,
+)
 from src.verify_cli import main as verify_main
 from src.verify_cli import verify_database
 
@@ -87,6 +91,15 @@ def build_app(db_path: Path, calls: dict[str, int]) -> FastAPI:
             yield b"-complete"
 
         return StreamingResponse(chunks(), media_type="text/plain")
+
+    @app.post("/cookies/{account_id}")
+    @audited(action="payout.cookies", resource="account_id")
+    async def cookies(account_id: str):
+        response = Response(content=account_id.encode(), media_type="text/plain")
+        response.raw_headers.extend(
+            [(b"set-cookie", b"first=1"), (b"set-cookie", b"second=2")]
+        )
+        return response
 
     return app
 
@@ -194,6 +207,16 @@ def test_sync_idempotency_and_unmodified_routes(tmp_path: Path) -> None:
         streamed = client.post("/stream/acct-stream")
         assert streamed.status_code == 200
         assert streamed.content == b"acct-stream-complete"
+        too_large = client.post(
+            "/refund/acct-large", content=b"x" * (MAX_REQUEST_BYTES + 1)
+        )
+        assert too_large.status_code == 413
+        assert calls["refund"] == 0
+        cookie_headers = {"Idempotency-Key": "cookie-replay"}
+        original = client.post("/cookies/acct-cookie", headers=cookie_headers)
+        replay = client.post("/cookies/acct-cookie", headers=cookie_headers)
+        assert replay.content == original.content
+        assert replay.headers.get_list("set-cookie") == ["first=1", "second=2"]
         assert calls["sync"] == 1
 
 

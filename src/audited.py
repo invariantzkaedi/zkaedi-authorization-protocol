@@ -28,6 +28,7 @@ from src.context_bound_epoch_protocol import (
     Ed25519KeyRing,
     KeyPurpose,
     KeyStatus,
+    MAX_REQUEST_BYTES,
     canonical_json_object,
 )
 
@@ -329,12 +330,12 @@ def _replay_response(serialized: bytes) -> Response:
     headers = list(record["headers"])
     headers.extend(record["receipt_headers"].items())
     body = base64.b64decode(record["body"])
-    return Response(
-        content=body,
-        status_code=record["status_code"],
-        headers=dict(headers),
-        media_type=record.get("media_type"),
-    )
+    response = Response(content=body, status_code=record["status_code"])
+    response.raw_headers = [
+        (name.encode("latin-1").lower(), value.encode("latin-1"))
+        for name, value in headers
+    ]
+    return response
 
 
 def _prepare_audit(
@@ -477,11 +478,28 @@ class ZkaediMiddleware:
             return
         messages: list[Message] = []
         body_parts: list[bytes] = []
+        request_size = 0
         more_body = True
         while more_body:
             message = await receive()
             messages.append(message)
-            body_parts.append(message.get("body", b""))
+            body_part = message.get("body", b"")
+            request_size += len(body_part)
+            if request_size > MAX_REQUEST_BYTES:
+                body = b'{"detail":"Request body too large"}'
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 413,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode("ascii")),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                return
+            body_parts.append(body_part)
             more_body = message.get("more_body", False)
         raw_body = b"".join(body_parts)
         try:
