@@ -48,12 +48,20 @@ async def refund_customer(account_id: str, payload: RefundRequest):
 Successful responses include a signed receipt and the associated chain position. Verify the persisted audit database offline with **zero secrets**:
 
 ```console
-$ python -m src.verify_cli /var/data/audit_vault.db
+$ python -m src.verify_cli /var/data/audit_vault.db --trusted-keys pinned_keys.json
 PASS: 1 audit events and 1 Ed25519 receipts verified
 Chain head: fba87da299df996e8bde412e3d0bcbde78d4c4b4b695fdb4cdb06f1c80ffbf86
 ```
 
-Optional: supply `--checkpoint <64-hex-chain-head>` to assert the chain matches an externally published checkpoint.
+- Supply `--trusted-keys <path>` to pin authorized signing keys out-of-band, rejecting rogue DBA key-replacement attacks.
+- Supply `--checkpoint <64-hex-chain-head>` to assert the chain matches an externally published checkpoint.
+- Pass `checkpoint_sink=file_checkpoint_sink("/var/log/checkpoints.jsonl")` (or `stdout_checkpoint_sink`) to stream checkpoints off-host into log aggregators (Vector, FluentBit) on every committed mutation.
+
+## What ZKAEDI is NOT
+
+- **Not an authentication provider**: Keep Clerk, Auth0, or Cognito for user identity. ZKAEDI proves what happened *after* authentication.
+- **Not a SIEM or log search engine**: It produces cryptographic proofs and action receipts; pipe your logs to Datadog, CloudWatch, or S3 as usual.
+- **Single-node SQLite today**: Hardened on SQLite 3.37+ in `STRICT` mode; PostgreSQL support is on the active roadmap.
 
 ## Use cases
 

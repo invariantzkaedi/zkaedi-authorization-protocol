@@ -9,9 +9,11 @@ import json
 import os
 import secrets
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from functools import wraps
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from cryptography.hazmat.primitives import serialization
@@ -361,6 +363,38 @@ class AuditRecorder:
             }
         finally:
             connection.close()
+
+    def export_public_keys(self) -> dict[str, str]:
+        """Exports registered receipt signing public keys as {key_id_hex: public_key_hex} for out-of-band pinning."""
+        connection = self.database.connect()
+        try:
+            return {
+                row[0].hex(): row[1].hex()
+                for row in connection.execute(
+                    "SELECT key_id, public_key FROM key_records WHERE purpose = 'receipt_signing'"
+                )
+            }
+        finally:
+            connection.close()
+
+
+def stdout_checkpoint_sink(checkpoint: dict[str, Any]) -> None:
+    """Concrete checkpoint sink streaming JSON-lines to stdout for log aggregators (Vector, FluentBit)."""
+    record = {"event": "zkaedi.checkpoint", **checkpoint}
+    sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def file_checkpoint_sink(file_path: str | os.PathLike[str]) -> Callable[[dict[str, Any]], None]:
+    """Concrete checkpoint sink appending JSON-lines to an out-of-band file or mounted log volume."""
+    path = Path(file_path)
+
+    def sink(checkpoint: dict[str, Any]) -> None:
+        record = {"event": "zkaedi.checkpoint", **checkpoint}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+    return sink
 
 
 def _replay_response(serialized: bytes) -> Response:

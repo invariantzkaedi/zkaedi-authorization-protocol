@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import json
@@ -13,12 +14,61 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 
+def load_trusted_keys(target: str) -> dict[bytes, bytes] | set[bytes]:
+    """Loads trusted public keys from a file path (JSON or line-delimited hex) or a raw hex string."""
+    path = Path(target)
+    if path.exists() and path.is_file():
+        content = path.read_text(encoding="utf-8").strip()
+    else:
+        content = target.strip()
+
+    def _decode_key(val: str) -> bytes:
+        val = val.strip()
+        if len(val) == 44 and val.endswith("="):
+            return base64.b64decode(val)
+        return bytes.fromhex(val)
+
+    # Try JSON
+    if content.startswith("{") or content.startswith("["):
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                return {_decode_key(k): _decode_key(v) for k, v in parsed.items()}
+            elif isinstance(parsed, list):
+                return {_decode_key(v) for v in parsed}
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+    # Try line-delimited text
+    keys_dict: dict[bytes, bytes] = {}
+    keys_set: set[bytes] = set()
+    has_mapping = False
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line:
+            key_id_str, pub_str = line.split(":", 1)
+            keys_dict[_decode_key(key_id_str)] = _decode_key(pub_str)
+            has_mapping = True
+        else:
+            keys_set.add(_decode_key(line))
+
+    if has_mapping:
+        return keys_dict
+    if keys_set:
+        return keys_set
+    raise ValueError(f"Could not parse any valid trusted keys from {target}")
+
+
 def verify_database(
     path: str,
     audit_key_or_checkpoint: bytes | str | None = None,
     checkpoint: str | None = None,
     *,
     audit_key: bytes | None = None,
+    trusted_keys: dict[bytes, bytes] | set[bytes] | None = None,
 ) -> tuple[bool, int, int, str]:
     if isinstance(audit_key_or_checkpoint, bytes):
         audit_key = audit_key_or_checkpoint
@@ -85,6 +135,16 @@ def verify_database(
             public_key = keys.get(key_id)
             if public_key is None:
                 return False, expected_sequence, receipt_count, "receipt signing key is not registered"
+            if trusted_keys is not None:
+                if isinstance(trusted_keys, dict):
+                    expected_pub = trusted_keys.get(key_id)
+                    if expected_pub is None:
+                        return False, expected_sequence, receipt_count, "receipt signing key is not in trusted keys"
+                    if not hmac.compare_digest(public_key, expected_pub):
+                        return False, expected_sequence, receipt_count, "receipt signing key does not match trusted public key"
+                elif isinstance(trusted_keys, (set, list, tuple)):
+                    if public_key not in trusted_keys:
+                        return False, expected_sequence, receipt_count, "receipt signing key is not in trusted keys"
             try:
                 signed = json.loads(signed_payload)
                 if (
@@ -119,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Verify ZKAEDI audit chain and Ed25519 receipts offline.")
     parser.add_argument("sqlite_path", help="Path to SQLite audit vault database")
     parser.add_argument("--checkpoint", help="Expected chain-head hash as 64 hexadecimal characters")
+    parser.add_argument("--trusted-keys", help="Path to file or hex string containing pinned trusted public keys")
     parser.add_argument("--audit-key", help="(Optional) Legacy HMAC audit key if verifying a legacy keyed chain")
     args = parser.parse_args(argv)
 
@@ -140,9 +201,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"FAIL: invalid ZKAEDI_AUDIT_KEY: {exc}")
             return 1
 
+    trusted_keys = None
+    if args.trusted_keys:
+        try:
+            trusted_keys = load_trusted_keys(args.trusted_keys)
+        except Exception as exc:
+            print(f"FAIL: invalid --trusted-keys: {exc}")
+            return 1
+
+    if not args.trusted_keys and not args.checkpoint:
+        print(
+            "NOTICE: Verifying against embedded key_records without --trusted-keys or --checkpoint "
+            "proves internal consistency, not authenticity against a rogue DBA with key-generation access."
+        )
+
     try:
         valid, events, receipts, detail = verify_database(
-            args.sqlite_path, checkpoint=args.checkpoint, audit_key=audit_key
+            args.sqlite_path,
+            checkpoint=args.checkpoint,
+            audit_key=audit_key,
+            trusted_keys=trusted_keys,
         )
     except (OSError, ValueError) as exc:
         valid, events, receipts, detail = False, 0, 0, str(exc)

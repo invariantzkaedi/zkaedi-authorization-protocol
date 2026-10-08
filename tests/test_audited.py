@@ -645,3 +645,106 @@ def test_checkpoint_sink_and_export_checkpoint(tmp_path: Path) -> None:
         # If someone provides a mismatched checkpoint, it fails
         assert verify_main([str(db_path), "--checkpoint", "f" * 64]) == 1
 
+
+def test_trusted_keys_pinning_and_dba_replacement(tmp_path: Path, capsys) -> None:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from src.audited import stdout_checkpoint_sink, file_checkpoint_sink
+
+    db_path = tmp_path / "pinned.db"
+    jsonl_log = tmp_path / "checkpoints.jsonl"
+
+    recorder = AuditRecorder(db_path, "pinned-service", key_encryption_key=b"k" * 32)
+    recorder.record(
+        principal_id="user1",
+        action="user.create",
+        resource="res1",
+        request_body={"user": "alice"},
+        status_code=200,
+        response_body=b'{"created": true}',
+        latency_ms=10.0,
+        context_digest=b"\x11" * 32,
+    )
+
+    # Test export_public_keys
+    public_keys = recorder.export_public_keys()
+    assert len(public_keys) == 1
+    key_id_hex, pub_hex = next(iter(public_keys.items()))
+
+    # Pin keys to a JSON file
+    pinned_json = tmp_path / "pinned_keys.json"
+    pinned_json.write_text(json.dumps(public_keys), encoding="utf-8")
+
+    # Verify with pinned keys out-of-band
+    assert verify_main([str(db_path), "--trusted-keys", str(pinned_json)]) == 0
+
+    # Pin keys to line-delimited file
+    pinned_txt = tmp_path / "pinned_keys.txt"
+    pinned_txt.write_text(f"{key_id_hex}:{pub_hex}\n", encoding="utf-8")
+    assert verify_main([str(db_path), "--trusted-keys", str(pinned_txt)]) == 0
+
+    # Verify with raw hex directly
+    assert verify_main([str(db_path), "--trusted-keys", pub_hex]) == 0
+
+    # Simulate Rogue DBA: generates a new Ed25519 key pair, replaces public key in key_records,
+    # and re-signs the receipt for sequence 1.
+    rogue_private = Ed25519PrivateKey.generate()
+    rogue_public = rogue_private.public_key().public_bytes_raw()
+    rogue_key_id = b"r" * 16
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP TRIGGER IF EXISTS key_records_delete_guard")
+    conn.execute("DROP TRIGGER IF EXISTS key_records_status_guard")
+    conn.execute("DROP TRIGGER IF EXISTS audit_events_update_guard")
+    conn.execute("DELETE FROM key_records")
+    conn.execute(
+        "INSERT INTO key_records(key_id, public_key, purpose, issuer_digest, status) VALUES(?, ?, 'receipt_signing', ?, 'active')",
+        (rogue_key_id, rogue_public, b"\x00" * 32),
+    )
+    # Fetch signed payload for receipt 1 and sign with rogue private key
+    signed_payload = conn.execute("SELECT signed_payload FROM zkaedi_receipts WHERE sequence = 1").fetchone()[0]
+    payload_dict = json.loads(signed_payload)
+    payload_dict["key_id"] = rogue_key_id.hex()
+    updated_signed_payload = json.dumps(payload_dict, separators=(",", ":")).encode("utf-8")
+    rogue_signature = rogue_private.sign(updated_signed_payload)
+    conn.execute(
+        "UPDATE zkaedi_receipts SET key_id = ?, signature = ?, signed_payload = ? WHERE sequence = 1",
+        (rogue_key_id, rogue_signature, updated_signed_payload),
+    )
+    # Also update event key_id in audit_events payload and recompute event_hash
+    event_payload = json.loads(conn.execute("SELECT payload FROM audit_events WHERE sequence = 1").fetchone()[0])
+    event_payload["key_id"] = rogue_key_id.hex()
+    new_event_payload_bytes = json.dumps(event_payload, separators=(",", ":")).encode("utf-8")
+    new_event_hash = hashlib.sha256(b"\x00" * 32 + new_event_payload_bytes).digest()
+    conn.execute(
+        "UPDATE audit_events SET event_hash = ?, payload = ? WHERE sequence = 1",
+        (new_event_hash, new_event_payload_bytes),
+    )
+    payload_dict["entry_hash"] = new_event_hash.hex()
+    final_signed_payload = json.dumps(payload_dict, separators=(",", ":")).encode("utf-8")
+    conn.execute(
+        "UPDATE zkaedi_receipts SET signature = ?, signed_payload = ? WHERE sequence = 1",
+        (rogue_private.sign(final_signed_payload), final_signed_payload),
+    )
+    conn.commit()
+    conn.close()
+
+    # Without pinned keys, verification succeeds for internal consistency:
+    assert verify_main([str(db_path)]) == 0
+
+    # BUT WITH PINNED TRUSTED KEYS: rogue DBA's replacement key is deterministically caught!
+    assert verify_main([str(db_path), "--trusted-keys", str(pinned_json)]) == 1
+    assert verify_main([str(db_path), "--trusted-keys", str(pinned_txt)]) == 1
+
+    # Test concrete sinks
+    sink_file = file_checkpoint_sink(jsonl_log)
+    sink_file(recorder.export_checkpoint())
+    assert jsonl_log.exists()
+    lines = jsonl_log.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    assert "zkaedi.checkpoint" in lines[0]
+
+    stdout_checkpoint_sink(recorder.export_checkpoint())
+    captured = capsys.readouterr()
+    assert "zkaedi.checkpoint" in captured.out
+
+

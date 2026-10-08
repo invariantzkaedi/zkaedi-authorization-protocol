@@ -34,8 +34,12 @@ ZKAEDI resolves this by strictly decoupling signing secrets from verification:
   - **Payload Tampering**: Modifying any payload invalidates both the SHA-256 chain and the Ed25519 receipt signature.
   - **Reordering**: Changing row sequences or swapping rows breaks the `previous_hash` linkage.
   - **Row Insertion**: An attacker cannot generate valid Ed25519 signatures for inserted events without the private signing key.
-  - **Tail Truncation**: Deleting recent rows from the end of the table is detectable by comparing against an externally retained checkpoint (`--checkpoint <64-hex-chain-head>`).
-- **Defense-in-Depth vs Cryptographic Boundary**: SQLite triggers (`audit_events_update_guard`, `audit_events_delete_guard`, `key_records_delete_guard`) provide runtime defense-in-depth against application bugs or accidental SQL updates. They are **not** considered a cryptographic boundary against a malicious DBA with direct file access. Cryptographic proof is enforced exclusively via hash chains and Ed25519 signatures.
+  - **Tail Truncation**: Mitigated when checkpoints are exported. Deleting recent rows from the end of the table is detectable by comparing against an externally retained checkpoint (`--checkpoint <64-hex-chain-head>`).
+- **Internal Consistency vs. Authenticity (Trust Anchors)**:
+  - Without an out-of-band pinned public key (`--trusted-keys`) or an external checkpoint (`--checkpoint`), running the offline verifier proves **internal mathematical consistency** against the embedded `key_records`, but **not authenticity against a rogue DBA**.
+  - A malicious DBA with raw database access could generate a new Ed25519 key pair, overwrite `key_records`, re-calculate event hashes, and re-sign forged receipts.
+  - To prove **authenticity against a DBA**, the auditor pins authorized public keys out-of-band via `--trusted-keys <file>` (exported via `AuditRecorder.export_public_keys()`). With pinned keys, any unauthorized key replacement is caught deterministically.
+- **Defense-in-Depth vs Cryptographic Boundary**: SQLite triggers (`audit_events_update_guard`, `audit_events_delete_guard`, `key_records_delete_guard`) provide runtime defense-in-depth against application bugs or accidental SQL updates. They are **not** considered a cryptographic boundary against a malicious DBA with direct file access. Cryptographic proof is enforced exclusively via hash chains, pinned public keys, and Ed25519 signatures.
 
 ### 2. Auditor / Downstream Log Collector (Untrusted Verifier)
 

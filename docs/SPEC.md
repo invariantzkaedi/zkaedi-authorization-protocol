@@ -112,7 +112,8 @@ The offline verification CLI (`src/verify_cli.py`) operates with **zero secrets*
 3. Verifies `previous_hash == expected_previous` and `event_hash == SHA-256(previous_hash || payload)`.
 4. Retrieves the registered public key from `key_records` for each receipt in `zkaedi_receipts` and validates the Ed25519 signature over `signed_payload`.
 5. Validates that `signed_payload` matches the event fields and `entry_hash`.
-6. (Optional) If `--checkpoint <hex>` is provided, verifies that the final chain head matches the trusted checkpoint.
+6. (Optional) If `--trusted-keys <file>` is provided, validates that each signing key is pinned out-of-band, rejecting any rogue DBA key-replacement attacks.
+7. (Optional) If `--checkpoint <hex>` is provided, verifies that the final chain head matches the trusted checkpoint.
 
 ---
 
@@ -120,4 +121,8 @@ The offline verification CLI (`src/verify_cli.py`) operates with **zero secrets*
 
 To protect against tail truncation or total database destruction:
 - `AuditRecorder.export_checkpoint()` returns `{sequence, chain_head, receipt_signature, key_id, service, timestamp}`.
-- `ZkaediMiddleware(checkpoint_sink=...)` invokes an external callback on every committed mutation, enabling immediate streaming of checkpoints to external syslog, S3 Object Lock, or SIEM pipelines.
+- `AuditRecorder.export_public_keys()` returns `{key_id_hex: public_key_hex}` for out-of-band key pinning.
+- `ZkaediMiddleware(checkpoint_sink=...)` invokes an external callback on every committed mutation.
+- Built-in concrete sinks:
+  - `stdout_checkpoint_sink`: Streams single-line JSON records (`{"event": "zkaedi.checkpoint", ...}`) to standard output for log shippers (FluentBit, Vector, Datadog Agent).
+  - `file_checkpoint_sink(path)`: Appends JSON lines to a mounted log volume or out-of-band file.

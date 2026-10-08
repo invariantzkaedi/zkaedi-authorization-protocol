@@ -1,17 +1,20 @@
 """End-to-End Quickstart & Tamper-Evident Demonstration for ZKAEDI.
 
 This script executes four sequential steps:
-1. Starts a FastAPI application equipped with ZkaediMiddleware and an @audited mutation endpoint.
-2. Executes an audited payout mutation, verifying the emission of Ed25519 action receipt headers.
-3. Runs the offline verifier CLI with zero environment variables and zero secrets, confirming integrity.
-4. Simulates a rogue database administrator bypassing SQLite triggers and tampering with a row payload,
-   then runs the zero-secret offline verifier again to demonstrate deterministic failure.
+1. Starts a FastAPI application equipped with ZkaediMiddleware, an @audited mutation endpoint,
+   and an out-of-band JSONL checkpoint sink for external log aggregation.
+2. Executes an audited payout mutation, verifying the emission of Ed25519 action receipt headers
+   and export of out-of-band pinned public keys.
+3. Runs the offline verifier CLI with zero secrets and pinned trusted keys, confirming integrity.
+4. Simulates a rogue database administrator bypassing SQLite triggers and tampering with records,
+   then runs the offline verifier again to demonstrate deterministic failure.
 """
 
+import json
 import os
-import sys
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 # Ensure repo root is on sys.path
@@ -22,11 +25,15 @@ if str(REPO_ROOT) not in sys.path:
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
-from src.audited import audited, ZkaediMiddleware
+from src.audited import audited, file_checkpoint_sink, ZkaediMiddleware
 
 DB_PATH = "demo_audit_vault.db"
-if os.path.exists(DB_PATH):
-    os.remove(DB_PATH)
+CHECKPOINT_PATH = "demo_checkpoints.jsonl"
+PINNED_KEYS_PATH = "demo_pinned_keys.json"
+
+for path in [DB_PATH, CHECKPOINT_PATH, PINNED_KEYS_PATH]:
+    if os.path.exists(path):
+        os.remove(path)
 
 
 class RefundPayload(BaseModel):
@@ -35,11 +42,19 @@ class RefundPayload(BaseModel):
 
 
 app = FastAPI(title="ZKAEDI Demo App")
+middleware = ZkaediMiddleware(
+    app,
+    service_name="billing-service",
+    sqlite_path=DB_PATH,
+    key_encryption_key="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    checkpoint_sink=file_checkpoint_sink(CHECKPOINT_PATH),
+)
 app.add_middleware(
     ZkaediMiddleware,
     service_name="billing-service",
     sqlite_path=DB_PATH,
     key_encryption_key="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    checkpoint_sink=file_checkpoint_sink(CHECKPOINT_PATH),
 )
 
 
@@ -72,11 +87,33 @@ def main():
         ]:
             print(f"  {h}: {res.headers.get(h)}")
 
+    # Verify checkpoint left the box into external JSONL sink
+    assert os.path.exists(CHECKPOINT_PATH)
+    checkpoint_line = Path(CHECKPOINT_PATH).read_text(encoding="utf-8").strip()
+    checkpoint = json.loads(checkpoint_line)
+    print(f"\n[Checkpoint Sink] Out-of-band checkpoint streamed to {CHECKPOINT_PATH}:")
+    print(f"  Sequence: {checkpoint['sequence']}, Chain Head: {checkpoint['chain_head'][:16]}...")
+
+    # Export authorized public keys for out-of-band pinning
+    recorder = middleware.recorder
+    pinned_keys = recorder.export_public_keys()
+    Path(PINNED_KEYS_PATH).write_text(json.dumps(pinned_keys, indent=2), encoding="utf-8")
+    print(f"[Trust Anchor] Pinned {len(pinned_keys)} authorized signing key(s) to {PINNED_KEYS_PATH}")
+
     clean_env = {k: v for k, v in os.environ.items() if not k.startswith("ZKAEDI_")}
 
-    print("\n[Step 2] Verifying offline with ZERO secrets (no ZKAEDI_* env vars)...")
+    print("\n[Step 2] Verifying offline with ZERO secrets and pinned trusted keys...")
     proc = subprocess.run(
-        [sys.executable, "-m", "src.verify_cli", DB_PATH],
+        [
+            sys.executable,
+            "-m",
+            "src.verify_cli",
+            DB_PATH,
+            "--trusted-keys",
+            PINNED_KEYS_PATH,
+            "--checkpoint",
+            checkpoint["chain_head"],
+        ],
         env=clean_env,
         capture_output=True,
         text=True,
@@ -95,7 +132,14 @@ def main():
 
     print("\n[Step 4] Running offline verifier on tampered database...")
     proc_tampered = subprocess.run(
-        [sys.executable, "-m", "src.verify_cli", DB_PATH],
+        [
+            sys.executable,
+            "-m",
+            "src.verify_cli",
+            DB_PATH,
+            "--trusted-keys",
+            PINNED_KEYS_PATH,
+        ],
         env=clean_env,
         capture_output=True,
         text=True,
@@ -108,8 +152,9 @@ def main():
     print("VERIFICATION SUCCEEDED: Tampering was detected deterministically with ZERO secrets.")
     print("=" * 70)
 
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    for path in [DB_PATH, CHECKPOINT_PATH, PINNED_KEYS_PATH]:
+        if os.path.exists(path):
+            os.remove(path)
 
 
 if __name__ == "__main__":
